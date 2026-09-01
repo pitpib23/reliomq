@@ -12,39 +12,39 @@ Run it and read the stderr output top to bottom:
 
     python examples/debug_logging.py
 
-You should see: the durable queue accepting the message immediately
-(`publish()` never waits on the network), a connection attempt that never
-completes, and -- once you point this at a real broker instead -- you would
-additionally see each publish attempt, the broker PUBACK, the wait for the
-application ACK, and either delivery confirmation or a retry with its
-reason. Change HOST/PORT below to a real broker to see that full picture.
+You should see: the Outbox accepting the message immediately (`publish()`
+never waits on the network), a connection attempt that never completes, and
+-- once you point this at a real broker instead -- you would additionally
+see each publish attempt, the broker PUBACK, the wait for the DeliveryAck,
+and either delivery confirmation or a retry with its reason. Change
+HOST/PORT below to a real broker to see that full picture.
 """
 
 from __future__ import annotations
 
 import time
 
-from reliomq import PublisherConfig, ReliablePublisher
+from reliomq import Sender, SenderConfig
 
 
 # Intentionally nothing is listening here. Swap in a real broker to see the
-# rest of the lifecycle (PUBACK, application ACK, delivery) in DEBUG detail.
+# rest of the lifecycle (PUBACK, DeliveryAck, delivery) in DEBUG detail.
 HOST = "localhost"
 PORT = 18830
 
-config = PublisherConfig(
+config = SenderConfig(
     host=HOST,
     port=PORT,
-    queue_path="debug_pending.jsonl",
+    outbox_path="debug_pending.jsonl",
     retry_interval=1.0,
     debug=True,
 )
 
-with ReliablePublisher(config) as publisher:
-    message_id = publisher.publish(
-        topic="factory/machine1/data",
-        payload={"temperature": 25.2},
+with Sender(config) as sender:
+    message_id = sender.publish(
+        "factory/machine1/data",
+        {"temperature": 25.2},
     )
-    print(f"message {message_id} durably queued; watching for a few seconds...")
+    print(f"message {message_id} stored in the Outbox; watching for a few seconds...")
     time.sleep(4.0)
-    print(f"pending={publisher.pending_count()} -- see the DEBUG lines above for why")
+    print(f"pending={sender.pending_count()} -- see the DEBUG lines above for why")

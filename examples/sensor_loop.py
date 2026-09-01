@@ -1,19 +1,20 @@
-"""Periodic publisher loop: the shape most edge/IoT integrations actually use.
+"""Periodic Sender loop: the shape most edge/IoT integrations actually use.
 
 Unlike basic.py's one-shot publish, this simulates a sensor that produces a
 reading every few seconds for the life of the process. It shows the pattern
 recommended for long-running services:
 
-- start() once, publish() many times from the sensor loop;
+- connect()/loop_start() once, publish() many times from the sensor loop
+  (never recreate the Sender per reading);
 - never block the sensor loop on delivery -- publish() only waits for the
-  durable append, not for the network;
+  durable Outbox append, not for the network;
 - check pending_count() to size a "delivery is behind" warning rather than
   polling wait_for_delivery() per reading, which would serialize readings
   behind network round trips;
-- stop() on SIGINT/SIGTERM leaves any in-flight message durably queued for
-  the next run instead of losing it;
+- loop_stop()/disconnect() on SIGINT/SIGTERM leaves any in-flight message
+  durably queued for the next run instead of losing it;
 - `log_level="INFO"` on the config gives a running narration of connects,
-  queued readings, and confirmed deliveries with zero `logging` setup.
+  stored readings, and confirmed deliveries with zero `logging` setup.
 
 Run against a local broker for a real trial:
 
@@ -28,7 +29,7 @@ import signal
 import threading
 import time
 
-from reliomq import PublisherConfig, ReliablePublisher
+from reliomq import Sender, SenderConfig
 
 
 READING_INTERVAL_SECONDS = 5.0
@@ -42,19 +43,20 @@ def read_sensor() -> dict:
 
 
 def main() -> None:
-    config = PublisherConfig(
+    config = SenderConfig(
         host="localhost",
         port=1883,
-        queue_path="sensor_pending.jsonl",
-        envelope_topic="reliable/ingress",
-        ack_topic="reliable/acks",
+        outbox_path="sensor_pending.jsonl",
+        relay_topic="reliable/ingress",
+        delivery_ack_topic="reliable/acks",
         ack_timeout=3.0,
         retry_interval=10.0,
         log_level="INFO",
     )
 
-    publisher = ReliablePublisher(config)
-    publisher.start()
+    sender = Sender(config)
+    sender.connect()
+    sender.loop_start()  # harmless no-op here -- connect() already did this
 
     shutdown_requested = threading.Event()
 
@@ -75,11 +77,9 @@ def main() -> None:
     try:
         while not shutdown_requested.is_set():
             reading = read_sensor()
-            message_id = publisher.publish(
-                topic="factory/machine1/temperature", payload=reading
-            )
+            message_id = sender.publish("factory/machine1/temperature", reading)
 
-            pending = publisher.pending_count()
+            pending = sender.pending_count()
             if pending >= PENDING_WARNING_THRESHOLD:
                 app_logger.warning(
                     "Delivery is falling behind | pending=%s | latest=%s",
@@ -89,9 +89,10 @@ def main() -> None:
 
             shutdown_requested.wait(timeout=READING_INTERVAL_SECONDS)
     finally:
-        # Any reading already durably queued survives this call and the
-        # process exit; it is retried the next time this program starts.
-        publisher.stop()
+        # Any reading already stored in the Outbox survives this call and
+        # the process exit; it is retried the next time this program starts.
+        sender.loop_stop()
+        sender.disconnect()
 
 
 if __name__ == "__main__":

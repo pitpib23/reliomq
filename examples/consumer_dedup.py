@@ -1,13 +1,13 @@
 """Destination-side consumer showing the recommended dedup pattern.
 
-The library guarantees at-least-once delivery, not exactly-once: a bridge can
-publish successfully and then fail to deliver its own confirmation, causing
+The library guarantees at-least-once delivery, not exactly-once: a Relay can
+publish successfully and then fail to deliver its own DeliveryAck, causing
 the source to retry an already-delivered message. This example is a plain
-Paho subscriber -- it is NOT part of reliomq -- showing how any
-final consumer of ReliableMqttBridge's destination messages should use the
-retained `message_id` to make handling idempotent.
+Paho subscriber -- it is NOT part of reliomq -- showing how any final
+consumer of a Relay's destination messages should use the retained
+`message_id` to make handling idempotent.
 
-Run against the same broker/topic the bridge forwards to:
+Run against the same broker/topic the Relay forwards to:
 
     python examples/consumer_dedup.py
 """

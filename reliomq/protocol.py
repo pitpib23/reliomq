@@ -3,18 +3,21 @@
 Three envelope shapes travel over MQTT, all sharing one field that lets a
 single message be traced end-to-end: ``message_id``.
 
-- :class:`MessageEnvelope` -- what :class:`~reliomq.publisher.ReliablePublisher`
-  puts on the wire (on the *envelope topic*, see ``PublisherConfig``): the
-  application's ``topic``/``payload`` plus a stable ``message_id``.
-- :class:`DeliveryEnvelope` -- what :class:`~reliomq.bridge.ReliableMqttBridge`
-  publishes to the final *application* topic: just ``payload`` plus the same
+- :class:`MessageEnvelope` -- what :class:`~reliomq.sender.Sender` puts on
+  the wire (on the *relay topic*, see ``SenderConfig``): the application's
+  ``topic``/``payload`` plus a stable ``message_id``.
+- :class:`DeliveryEnvelope` -- what :class:`~reliomq.relay.Relay` publishes
+  to the final *application* topic: just ``payload`` plus the same
   ``message_id``, so a consumer can deduplicate.
-- :class:`Ack` -- what the bridge publishes back to the publisher's ack topic
-  once the destination delivery above is confirmed: only a ``message_id``.
+- :class:`DeliveryAck` -- what the relay publishes back to the sender's
+  delivery-ack topic once the destination delivery above is confirmed: only
+  a ``message_id``. This is a reliomq-specific, application-level
+  acknowledgement -- distinct from (and stronger than) an MQTT PUBACK,
+  which only proves the broker accepted one publish.
 
 On the wire, the JSON field is still spelled ``event_id`` for every one of
-these -- that has not changed since 0.1.0, so a 0.1.x publisher and a 0.2.x
-bridge (or vice versa) remain fully interoperable across a rolling upgrade.
+these -- that has not changed since 0.1.0, so a 0.1.x sender and a 0.3.x
+relay (or vice versa) remain fully interoperable across a rolling upgrade.
 Only the Python-facing name changed, because "event" reads as "something
 happened" when what this really is is a stable ID for *one message*.
 """
@@ -356,8 +359,16 @@ class DeliveryEnvelope:
 
 
 @dataclass(frozen=True, slots=True, init=False)
-class Ack:
-    """A source acknowledgement correlated solely by a stable message ID."""
+class DeliveryAck:
+    """A reliomq-specific, application-level end-to-end acknowledgement.
+
+    Correlated solely by a stable ``message_id``. Published by a
+    :class:`~reliomq.relay.Relay` back to the sender's delivery-ack topic
+    once (and only once) the destination publish has itself been QoS 1
+    confirmed. Not the same thing as an MQTT PUBACK: a PUBACK proves a
+    broker accepted one publish; a ``DeliveryAck`` proves the message
+    actually reached its real destination topic.
+    """
 
     message_id: str
     version: int
@@ -369,7 +380,7 @@ class Ack:
         *,
         event_id: str | None = None,
     ) -> None:
-        resolved_id = _resolve_message_id(message_id, event_id, owner="Ack")
+        resolved_id = _resolve_message_id(message_id, event_id, owner="DeliveryAck")
         object.__setattr__(self, "message_id", resolved_id)
         object.__setattr__(self, "version", version)
         self.__post_init__()
@@ -382,15 +393,21 @@ class Ack:
     def event_id(self) -> str:
         """Deprecated alias for :attr:`message_id`."""
 
-        warn_deprecated_attribute(owner="Ack", old_name="event_id", new_name="message_id")
+        warn_deprecated_attribute(
+            owner="DeliveryAck", old_name="event_id", new_name="message_id"
+        )
         return self.message_id
 
     def to_bytes(self) -> bytes:
         return encode_ack(self)
 
     @classmethod
-    def from_bytes(cls, data: WireData) -> Ack:
+    def from_bytes(cls, data: WireData) -> DeliveryAck:
         return decode_ack(data)
+
+
+# Deprecated (0.1.x/0.2.x) alias -- same class, same wire format.
+Ack = DeliveryAck
 
 
 def encode_message(envelope: MessageEnvelope) -> bytes:
@@ -447,16 +464,16 @@ def decode_delivery(data: WireData) -> DeliveryEnvelope:
     )
 
 
-def encode_ack(ack: Ack) -> bytes:
-    if not isinstance(ack, Ack):
-        raise ProtocolError("encode_ack requires an Ack")
+def encode_ack(ack: DeliveryAck) -> bytes:
+    if not isinstance(ack, DeliveryAck):
+        raise ProtocolError("encode_ack requires a DeliveryAck")
     return _canonical_bytes({"version": ack.version, "event_id": ack.message_id})
 
 
-def decode_ack(data: WireData) -> Ack:
+def decode_ack(data: WireData) -> DeliveryAck:
     value = _decode_json(data)
     _require_schema(value, frozenset(("version", "event_id")), "acknowledgement")
-    return Ack(version=value["version"], message_id=value["event_id"])
+    return DeliveryAck(version=value["version"], message_id=value["event_id"])
 
 
 # ---------------------------------------------------------------------------

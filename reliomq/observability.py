@@ -6,16 +6,16 @@ itself, INFO/DEBUG messages stay invisible (see the package docstring in
 ``reliomq/__init__.py`` and the README's Logging section for the fully
 manual alternative).
 
-This module is the implementation behind ``PublisherConfig``/``BridgeConfig``'s
+This module is the implementation behind ``SenderConfig``/``RelayConfig``'s
 ``log_level=``/``debug=`` fields: a small convenience so a developer who does
 not want to think about Python logging can still see what reliomq is doing.
 Calling :func:`enable_logging` attaches one ``StreamHandler`` to the
 ``"reliomq"`` logger (never to the root logger) and stops it from
 propagating further, so turning this on can never duplicate lines through a
 handler your application already configured elsewhere. It is idempotent and
-thread-safe: call it as many times as you like (every ``ReliablePublisher``/
-``ReliableMqttBridge`` that has ``log_level``/``debug`` set calls it once at
-construction time) and only one handler is ever attached.
+thread-safe: call it as many times as you like (every ``Sender``/``Relay``
+that has ``log_level``/``debug`` set calls it once at construction time)
+and only one handler is ever attached.
 """
 
 from __future__ import annotations
@@ -67,8 +67,8 @@ def normalize_log_level(value: int | str) -> int:
 def enable_logging(level: int | str = logging.INFO, *, stream: TextIO | None = None) -> logging.Logger:
     """Attach a simple stderr handler to reliomq's logger tree, idempotently.
 
-    This is the function ``log_level=``/``debug=True`` on ``PublisherConfig``
-    and ``BridgeConfig`` call for you; call it directly if you want reliomq's
+    This is the function ``log_level=``/``debug=True`` on ``SenderConfig``
+    and ``RelayConfig`` call for you; call it directly if you want reliomq's
     quick-start logging without going through a config object (for example,
     before constructing anything).
 

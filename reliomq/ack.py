@@ -1,9 +1,9 @@
 """Thread-safe correlation for one in-flight application acknowledgement.
 
-Internal to :class:`~reliomq.publisher.ReliablePublisher`: not part of the
-public API, so its ``message_id`` parameter was not given a deprecated
-``event_id`` alias -- there is nothing outside this package that constructs
-or calls an :class:`AckTracker` directly.
+Internal to :class:`~reliomq.sender.Sender`: not part of the public API, so
+its ``message_id`` parameter was not given a deprecated ``event_id`` alias
+-- there is nothing outside this package that constructs or calls an
+:class:`AckTracker` directly.
 """
 
 from __future__ import annotations

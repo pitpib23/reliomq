@@ -2,6 +2,105 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.3.0 — 2026-09-01
+
+A naming, usability, and documentation follow-up to 0.2.0: reliomq's public
+class names are now short and Paho-familiar, and the `Sender`/`Relay`
+lifecycle deliberately echoes `paho-mqtt`'s `connect()`/`loop_start()`/
+`publish()`/`loop_stop()`/`disconnect()` shape, without pretending
+reliomq's stronger delivery guarantees behave identically to plain MQTT.
+0.2.0's own naming direction (`event_id`→`message_id`, INFO/DEBUG
+observability, `log_level=`/`debug=`) is unchanged and fully preserved.
+Reliability semantics, the wire protocol, and the on-disk Outbox format are
+all unchanged from 0.1.0/0.2.0.
+
+### Naming migration
+
+- **`ReliablePublisher` → `Sender`**, **`ReliableMqttBridge` → `Relay`**,
+  **`PublisherConfig`/`ReliabilityConfig` → `SenderConfig`**,
+  **`BridgeConfig` → `RelayConfig`**, **`DurableMessageStore` → `Outbox`**
+  (`StoreError` → `OutboxError`), **`Ack` → `DeliveryAck`**. Every old name
+  is kept as a working alias (see Compatibility below).
+- **`queue_path=` → `outbox_path=`**, **`data_topic=`/`envelope_topic=` →
+  `relay_topic=`**, **`ack_topic=` → `delivery_ack_topic=`** on both
+  configs. The topic field has now been renamed twice across releases
+  (0.1.0 `data_topic` → 0.2.0 `envelope_topic` → 0.3.0 `relay_topic`); all
+  three spellings are still accepted as constructor keywords and read-back
+  properties.
+- Canonical module layout: `reliomq/sender.py`, `reliomq/relay.py`,
+  `reliomq/outbox.py`. The old `reliomq/publisher.py`,
+  `reliomq/bridge.py`, `reliomq/store.py` module paths still work as thin
+  re-export shims.
+- **`publish()` and `wait_for_delivery()` are unchanged and are not being
+  renamed** to `send()`/`wait_until_delivered()` — they were already the
+  right, Paho-familiar names.
+
+### Paho-familiar lifecycle (new, additive)
+
+- `Sender` gained `connect()`, `disconnect()`, `loop_start()`, `loop_stop()`,
+  and `is_connected()`. `connect()`/`start()`/`loop_start()` are three names
+  for the exact same operation (likewise `disconnect()`/`stop()`/
+  `loop_stop()`) — reliomq cannot honestly separate "connected" from
+  "processing the Outbox" the way raw Paho can, since durable delivery *is*
+  that background worker; this is documented explicitly rather than faked.
+  `is_connected()` mirrors Paho's own semantics (transport state only) and
+  is documented as not implying delivery-readiness.
+- `Relay` gained `connect()`, `disconnect()`, `loop_start()`, `loop_stop()`,
+  `source_connected`, and `destination_connected`. `Relay.connect()` brings
+  up *both* broker connections together, by design — there is no
+  per-broker `connect()` in this API.
+- `sender.outbox` is the new public attribute name for the durable store
+  (was `sender.store`); `sender.store` still works as a read-only alias.
+- Fixed a latent naming collision introduced by 0.2.0's `event_id`→
+  `message_id` rename: two internal SUBACK-callback parameters were also
+  named `message_id`/`event_id` but represent Paho's own MQTT packet
+  identifier (`mid`), an unrelated concept. Renamed those internal
+  parameters to `mid` so the two concepts can't be confused; no public API
+  or log output was affected (log lines already said `mid=`).
+
+### Documentation
+
+- New README sections: "How reliomq works" (mental-model diagram +
+  PUBACK-vs-DeliveryAck table), "Architecture overview", "If you already
+  know Paho MQTT" (mapping table + the two important differences),
+  "Publishing" (all seven canonical publish patterns: basic, capture ID,
+  publish-and-continue, publish-and-wait, offline publish, restart
+  recovery, pending-count monitoring), "Relay integration", "Cookbook",
+  and a full "Public API" reference covering every public class, method,
+  property, and exception with a minimal example each.
+- New examples: `paho_style_lifecycle.py` (explicit lifecycle shown
+  equivalent to the context-manager form) and `modbus_sensor.py` (a
+  realistic, read-only Modbus TCP poller bridged to MQTT through `Sender`;
+  requires the optional `pymodbus` package, not a reliomq dependency).
+  `examples/bridge.py` renamed to `examples/relay.py`.
+- All examples and their docstrings updated to the new preferred names and
+  lifecycle calls.
+
+### Compatibility
+
+- `ReliablePublisher`, `PublisherConfig`, `ReliabilityConfig`,
+  `ReliableMqttBridge`, `BridgeConfig`, `DurableMessageStore`, `StoreError`,
+  `Ack` — all kept as working aliases of their new names, each emitting
+  `DeprecationWarning`.
+- `queue_path=`, `data_topic=`/`envelope_topic=`, `ack_topic=` — all still
+  accepted as constructor keywords (each resolving to the new field, each
+  warning) and as read-back properties.
+- `sender.store` (property, warns) still reads `sender.outbox`.
+- `Relay(..., bridge_logger=...)` still works as an alias for
+  `relay_logger=` (warns).
+- Old module import paths (`reliomq.publisher`, `reliomq.bridge`,
+  `reliomq.store`) still work.
+- No intentional breaking changes. If you only ever imported names from
+  `reliomq.__all__` and didn't hardcode the JSON wire field name, nothing
+  in your code needs to change for this release to work.
+
+### Migration
+
+See the README's [Migrating to 0.3.0](README.md#migrating-to-030) section
+for a full old-API → new-API table with before/after code. The 0.2.0
+migration table below (`event_id`→`message_id`, etc.) is still accurate
+and complete for anyone upgrading directly from 0.1.x.
+
 ## 0.2.0 — 2026-09-01
 
 A usability, naming, documentation, and observability release. The

@@ -1,4 +1,4 @@
-"""Small Paho MQTT helpers shared by reliable publisher and bridge clients."""
+"""Small Paho MQTT helpers shared by Sender and Relay clients."""
 
 from __future__ import annotations
 

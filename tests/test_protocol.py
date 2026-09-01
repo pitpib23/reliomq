@@ -6,6 +6,7 @@ import warnings
 
 from reliomq.protocol import (
     Ack,
+    DeliveryAck,
     DeliveryEnvelope,
     MessageEnvelope,
     ProtocolError,
@@ -37,12 +38,15 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertEqual(DeliveryEnvelope.from_bytes(delivery.to_bytes()), delivery)
 
-    def test_ack_requires_exact_schema_and_valid_id(self) -> None:
-        self.assertEqual(Ack.from_bytes(Ack("ack-id").to_bytes()), Ack("ack-id"))
+    def test_delivery_ack_requires_exact_schema_and_valid_id(self) -> None:
+        self.assertEqual(
+            DeliveryAck.from_bytes(DeliveryAck("ack-id").to_bytes()),
+            DeliveryAck("ack-id"),
+        )
         with self.assertRaises(ProtocolError):
-            Ack.from_bytes(b'{"version":1,"event_id":"ack-id","ok":true}')
+            DeliveryAck.from_bytes(b'{"version":1,"event_id":"ack-id","ok":true}')
         with self.assertRaises(ProtocolError):
-            Ack.from_bytes(b'{"version":1,"event_id":"bad id"}')
+            DeliveryAck.from_bytes(b'{"version":1,"event_id":"bad id"}')
 
     def test_malformed_utf8_json_and_duplicate_keys_are_rejected(self) -> None:
         bad_values = (
@@ -52,7 +56,7 @@ class ProtocolTests(unittest.TestCase):
         )
         for value in bad_values:
             with self.subTest(value=value), self.assertRaises(ProtocolError):
-                Ack.from_bytes(value)
+                DeliveryAck.from_bytes(value)
 
     def test_only_strict_json_payload_types_are_supported(self) -> None:
         invalid_payloads = (
@@ -86,7 +90,7 @@ class DeprecatedEventIdCompatTests(unittest.TestCase):
         for cls, kwargs in (
             (MessageEnvelope, {"topic": "t", "payload": 1}),
             (DeliveryEnvelope, {"payload": 1}),
-            (Ack, {}),
+            (DeliveryAck, {}),
         ):
             with self.subTest(cls=cls.__name__):
                 with self.assertWarns(DeprecationWarning):
@@ -101,16 +105,19 @@ class DeprecatedEventIdCompatTests(unittest.TestCase):
 
     def test_conflicting_message_id_and_event_id_raise(self) -> None:
         with self.assertRaises(ProtocolError):
-            Ack(message_id="a", event_id="b")
+            DeliveryAck(message_id="a", event_id="b")
 
     def test_matching_message_id_and_event_id_is_accepted_with_one_warning(self) -> None:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            ack = Ack(message_id="same", event_id="same")
+            ack = DeliveryAck(message_id="same", event_id="same")
         self.assertEqual(ack.message_id, "same")
         self.assertTrue(
             any(issubclass(w.category, DeprecationWarning) for w in caught)
         )
+
+    def test_ack_is_the_same_class_as_delivery_ack(self) -> None:
+        self.assertIs(Ack, DeliveryAck)
 
     def test_new_event_id_alias_still_generates_a_valid_id_and_warns(self) -> None:
         with self.assertWarns(DeprecationWarning):

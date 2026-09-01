@@ -20,11 +20,11 @@ from pathlib import Path
 import paho.mqtt.client as mqtt
 
 from reliomq import (
-    BridgeConfig,
     DeliveryEnvelope,
-    PublisherConfig,
-    ReliableMqttBridge,
-    ReliablePublisher,
+    Relay,
+    RelayConfig,
+    Sender,
+    SenderConfig,
 )
 
 
@@ -75,7 +75,7 @@ def start_broker(port: int) -> subprocess.Popen[bytes]:
     "set RUN_MQTT_INTEGRATION=1 and install mosquitto to run",
 )
 class MosquittoIntegrationTests(unittest.TestCase):
-    def test_publisher_bridge_ack_and_destination_delivery(self) -> None:
+    def test_sender_relay_ack_and_destination_delivery(self) -> None:
         source_port = free_port()
         destination_port = free_port()
         source_broker = start_broker(source_port)
@@ -87,8 +87,8 @@ class MosquittoIntegrationTests(unittest.TestCase):
         subscription_ready = threading.Event()
         delivery_payloads: list[bytes] = []
         destination_topic = f"integration/output/{uuid.uuid4().hex}"
-        envelope_topic = f"integration/input/{uuid.uuid4().hex}"
-        ack_topic = f"integration/ack/{uuid.uuid4().hex}"
+        relay_topic = f"integration/input/{uuid.uuid4().hex}"
+        delivery_ack_topic = f"integration/ack/{uuid.uuid4().hex}"
 
         consumer = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -114,40 +114,40 @@ class MosquittoIntegrationTests(unittest.TestCase):
         self.addCleanup(consumer.disconnect)
         self.assertTrue(subscription_ready.wait(timeout=5.0))
 
-        bridge = ReliableMqttBridge(
-            BridgeConfig(
+        relay = Relay(
+            RelayConfig(
                 source_host="127.0.0.1",
                 source_port=source_port,
                 destination_host="127.0.0.1",
                 destination_port=destination_port,
-                envelope_topic=envelope_topic,
-                ack_topic=ack_topic,
+                relay_topic=relay_topic,
+                delivery_ack_topic=delivery_ack_topic,
             )
         )
-        bridge.start()
-        self.addCleanup(bridge.stop)
+        relay.start()
+        self.addCleanup(relay.stop)
 
         with tempfile.TemporaryDirectory() as directory:
-            publisher = ReliablePublisher(
-                PublisherConfig(
+            sender = Sender(
+                SenderConfig(
                     host="127.0.0.1",
                     port=source_port,
-                    queue_path=Path(directory) / "pending.jsonl",
-                    envelope_topic=envelope_topic,
-                    ack_topic=ack_topic,
+                    outbox_path=Path(directory) / "pending.jsonl",
+                    relay_topic=relay_topic,
+                    delivery_ack_topic=delivery_ack_topic,
                     ack_timeout=5.0,
                     retry_interval=0.1,
                 )
             )
-            publisher.start()
-            self.addCleanup(publisher.stop)
+            sender.start()
+            self.addCleanup(sender.stop)
 
-            message_id = publisher.publish(
+            message_id = sender.publish(
                 destination_topic,
                 {"temperature": 24.5},
             )
 
-            self.assertTrue(publisher.wait_for_delivery(message_id, timeout=10.0))
+            self.assertTrue(sender.wait_for_delivery(message_id, timeout=10.0))
             self.assertTrue(received.wait(timeout=5.0))
             delivery = DeliveryEnvelope.from_bytes(delivery_payloads[0])
             self.assertEqual(delivery.message_id, message_id)

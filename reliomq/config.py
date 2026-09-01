@@ -1,9 +1,17 @@
 """Validated configuration objects for reliable MQTT delivery.
 
-:class:`PublisherConfig` configures :class:`~reliomq.publisher.ReliablePublisher`
-and :class:`BridgeConfig` configures :class:`~reliomq.bridge.ReliableMqttBridge`
--- the naming is deliberately parallel so which config goes with which
-component is obvious on sight.
+:class:`SenderConfig` configures :class:`~reliomq.sender.Sender` and
+:class:`RelayConfig` configures :class:`~reliomq.relay.Relay` -- the naming
+is deliberately parallel so which config goes with which component is
+obvious on sight.
+
+Common MQTT vocabulary (``host``, ``port``, ``client_id``, ``qos``,
+``keepalive``) is kept as-is -- there's no reason to rename what
+`paho-mqtt` users already know. Fields specific to reliomq's durable
+delivery are named to say what they are: ``outbox_path`` (where messages
+are durably queued), ``relay_topic`` (the transport topic a :class:`Relay`
+reads from), ``delivery_ack_topic`` (where the end-to-end acknowledgement
+comes back on).
 
 Every field is validated eagerly in ``__post_init__``: an invalid config
 raises :class:`ConfigError` immediately at construction, never silently
@@ -20,15 +28,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ._compat import resolve_renamed_argument, warn_deprecated_attribute
+from ._compat import (
+    resolve_renamed_argument,
+    resolve_renamed_argument_chain,
+    warn_deprecated_attribute,
+)
 from .observability import normalize_log_level
 
 
-DEFAULT_ENVELOPE_TOPIC = "reliomq/messages"
-DEFAULT_ACK_TOPIC = "reliomq/acks"
+DEFAULT_RELAY_TOPIC = "reliomq/messages"
+DEFAULT_DELIVERY_ACK_TOPIC = "reliomq/acks"
 
-# Deprecated alias; the default value itself has not changed.
-DEFAULT_DATA_TOPIC = DEFAULT_ENVELOPE_TOPIC
+# Deprecated aliases; the default values themselves have not changed.
+DEFAULT_ENVELOPE_TOPIC = DEFAULT_RELAY_TOPIC
+DEFAULT_DATA_TOPIC = DEFAULT_RELAY_TOPIC
+DEFAULT_ACK_TOPIC = DEFAULT_DELIVERY_ACK_TOPIC
 
 
 class ConfigError(ValueError):
@@ -108,15 +122,15 @@ def _publish_topic(value: Any, name: str) -> str:
     return topic
 
 
-def _queue_path(value: Any) -> Path:
+def _outbox_path(value: Any, name: str = "outbox_path") -> Path:
     try:
         raw_path = os.fspath(value)
     except TypeError as error:
-        raise ConfigError("queue_path must be a filesystem path") from error
+        raise ConfigError(f"{name} must be a filesystem path") from error
     if isinstance(raw_path, bytes):
-        raise ConfigError("queue_path must be a text filesystem path")
+        raise ConfigError(f"{name} must be a text filesystem path")
     if not raw_path or "\x00" in raw_path:
-        raise ConfigError("queue_path must be a non-empty filesystem path")
+        raise ConfigError(f"{name} must be a non-empty filesystem path")
     return Path(raw_path).expanduser()
 
 
@@ -157,23 +171,23 @@ def _log_level(value: Any, debug: bool) -> int | None:
 
 
 @dataclass(frozen=True, slots=True, init=False)
-class PublisherConfig:
-    """Configuration for a durable, application-acknowledged publisher.
+class SenderConfig:
+    """Configuration for a durable, application-acknowledged :class:`~reliomq.sender.Sender`.
 
-    ``host``/``queue_path`` are the only required fields. ``envelope_topic``
-    and ``ack_topic`` are reliomq's own transport topics (not the
-    application topic you pass to :meth:`~reliomq.publisher.ReliablePublisher.publish`)
-    and must match the :class:`BridgeConfig` on the other end. Set
+    ``host``/``outbox_path`` are the only required fields. ``relay_topic``
+    and ``delivery_ack_topic`` are reliomq's own transport topics -- not the
+    application topic you pass to :meth:`~reliomq.sender.Sender.publish` --
+    and must match the :class:`RelayConfig` on the other end. Set
     ``log_level=`` or ``debug=True`` for zero-setup runtime visibility --
     see the README's "Logging" section for what each level shows.
     """
 
     host: str
-    queue_path: str | os.PathLike[str]
+    outbox_path: str | os.PathLike[str]
     port: int
     client_id: str | None
-    envelope_topic: str
-    ack_topic: str
+    relay_topic: str
+    delivery_ack_topic: str
     qos: int
     ack_timeout: float
     retry_interval: float
@@ -187,11 +201,11 @@ class PublisherConfig:
     def __init__(
         self,
         host: str,
-        queue_path: str | os.PathLike[str],
+        outbox_path: str | os.PathLike[str] | None = None,
         port: int = 1883,
         client_id: str | None = None,
-        envelope_topic: str | None = None,
-        ack_topic: str = DEFAULT_ACK_TOPIC,
+        relay_topic: str | None = None,
+        delivery_ack_topic: str | None = None,
         qos: int = 1,
         ack_timeout: float = 3.0,
         retry_interval: float = 10.0,
@@ -202,23 +216,47 @@ class PublisherConfig:
         log_level: int | str | None = None,
         debug: bool = False,
         *,
+        queue_path: str | os.PathLike[str] | None = None,
+        envelope_topic: str | None = None,
         data_topic: str | None = None,
+        ack_topic: str | None = None,
     ) -> None:
-        resolved_envelope_topic = resolve_renamed_argument(
-            new_value=envelope_topic,
-            old_value=data_topic,
-            new_name="envelope_topic",
-            old_name="data_topic",
-            owner="PublisherConfig",
-            default=DEFAULT_ENVELOPE_TOPIC,
+        resolved_outbox_path = resolve_renamed_argument(
+            new_value=outbox_path,
+            old_value=queue_path,
+            new_name="outbox_path",
+            old_name="queue_path",
+            owner="SenderConfig",
+            default=None,
             error_cls=ConfigError,
         )
+        if resolved_outbox_path is None:
+            raise ConfigError("outbox_path is required")
+
+        resolved_relay_topic = resolve_renamed_argument_chain(
+            new_value=relay_topic,
+            new_name="relay_topic",
+            legacy=[(envelope_topic, "envelope_topic"), (data_topic, "data_topic")],
+            owner="SenderConfig",
+            default=DEFAULT_RELAY_TOPIC,
+            error_cls=ConfigError,
+        )
+        resolved_delivery_ack_topic = resolve_renamed_argument(
+            new_value=delivery_ack_topic,
+            old_value=ack_topic,
+            new_name="delivery_ack_topic",
+            old_name="ack_topic",
+            owner="SenderConfig",
+            default=DEFAULT_DELIVERY_ACK_TOPIC,
+            error_cls=ConfigError,
+        )
+
         object.__setattr__(self, "host", host)
-        object.__setattr__(self, "queue_path", queue_path)
+        object.__setattr__(self, "outbox_path", resolved_outbox_path)
         object.__setattr__(self, "port", port)
         object.__setattr__(self, "client_id", client_id)
-        object.__setattr__(self, "envelope_topic", resolved_envelope_topic)
-        object.__setattr__(self, "ack_topic", ack_topic)
+        object.__setattr__(self, "relay_topic", resolved_relay_topic)
+        object.__setattr__(self, "delivery_ack_topic", resolved_delivery_ack_topic)
         object.__setattr__(self, "qos", qos)
         object.__setattr__(self, "ack_timeout", ack_timeout)
         object.__setattr__(self, "retry_interval", retry_interval)
@@ -232,17 +270,19 @@ class PublisherConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "host", _host(self.host, "host"))
-        object.__setattr__(self, "queue_path", _queue_path(self.queue_path))
+        object.__setattr__(self, "outbox_path", _outbox_path(self.outbox_path))
         object.__setattr__(self, "port", _port(self.port, "port"))
         object.__setattr__(self, "client_id", _client_id(self.client_id, "client_id"))
         object.__setattr__(
-            self, "envelope_topic", _publish_topic(self.envelope_topic, "envelope_topic")
+            self, "relay_topic", _publish_topic(self.relay_topic, "relay_topic")
         )
         object.__setattr__(
-            self, "ack_topic", _publish_topic(self.ack_topic, "ack_topic")
+            self,
+            "delivery_ack_topic",
+            _publish_topic(self.delivery_ack_topic, "delivery_ack_topic"),
         )
-        if self.envelope_topic == self.ack_topic:
-            raise ConfigError("envelope_topic and ack_topic must be different")
+        if self.relay_topic == self.delivery_ack_topic:
+            raise ConfigError("relay_topic and delivery_ack_topic must be different")
         object.__setattr__(self, "qos", _qos_one(self.qos))
         object.__setattr__(
             self, "ack_timeout", _positive_number(self.ack_timeout, "ack_timeout")
@@ -273,27 +313,62 @@ class PublisherConfig:
         )
 
     @property
-    def data_topic(self) -> str:
-        """Deprecated alias for :attr:`envelope_topic`."""
+    def queue_path(self) -> str | os.PathLike[str]:
+        """Deprecated alias for :attr:`outbox_path`."""
 
         warn_deprecated_attribute(
-            owner="PublisherConfig", old_name="data_topic", new_name="envelope_topic"
+            owner="SenderConfig", old_name="queue_path", new_name="outbox_path"
         )
-        return self.envelope_topic
+        return self.outbox_path
+
+    @property
+    def envelope_topic(self) -> str:
+        """Deprecated (0.2.x) alias for :attr:`relay_topic`."""
+
+        warn_deprecated_attribute(
+            owner="SenderConfig", old_name="envelope_topic", new_name="relay_topic"
+        )
+        return self.relay_topic
+
+    @property
+    def data_topic(self) -> str:
+        """Deprecated (0.1.x) alias for :attr:`relay_topic`."""
+
+        warn_deprecated_attribute(
+            owner="SenderConfig", old_name="data_topic", new_name="relay_topic"
+        )
+        return self.relay_topic
+
+    @property
+    def ack_topic(self) -> str:
+        """Deprecated alias for :attr:`delivery_ack_topic`."""
+
+        warn_deprecated_attribute(
+            owner="SenderConfig", old_name="ack_topic", new_name="delivery_ack_topic"
+        )
+        return self.delivery_ack_topic
 
 
-class ReliabilityConfig(PublisherConfig):
-    """Deprecated alias for :class:`PublisherConfig`.
+class PublisherConfig(SenderConfig):
+    """Deprecated (0.2.x) alias for :class:`SenderConfig`."""
 
-    Kept so ``from reliomq import ReliabilityConfig`` and existing
-    ``ReliabilityConfig(...)`` construction calls continue to work
-    unchanged; it will be removed in a future release.
-    """
+    def __post_init__(self) -> None:
+        warnings.warn(
+            "PublisherConfig is deprecated and will be removed in a future "
+            "release; use SenderConfig instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        super().__post_init__()
+
+
+class ReliabilityConfig(SenderConfig):
+    """Deprecated (0.1.x) alias for :class:`SenderConfig`."""
 
     def __post_init__(self) -> None:
         warnings.warn(
             "ReliabilityConfig is deprecated and will be removed in a future "
-            "release; use PublisherConfig instead.",
+            "release; use SenderConfig instead.",
             DeprecationWarning,
             stacklevel=3,
         )
@@ -301,12 +376,13 @@ class ReliabilityConfig(PublisherConfig):
 
 
 @dataclass(frozen=True, slots=True, init=False)
-class BridgeConfig:
+class RelayConfig:
     """Configuration for forwarding reliable envelopes between MQTT brokers.
 
-    ``envelope_topic``/``ack_topic`` must match the :class:`PublisherConfig`
-    on the source side. Set ``log_level=`` or ``debug=True`` for zero-setup
-    runtime visibility -- see the README's "Logging" section.
+    ``relay_topic``/``delivery_ack_topic`` must match the
+    :class:`SenderConfig` on the source side. Set ``log_level=`` or
+    ``debug=True`` for zero-setup runtime visibility -- see the README's
+    "Logging" section.
     """
 
     source_host: str
@@ -315,8 +391,8 @@ class BridgeConfig:
     destination_port: int
     source_client_id: str | None
     destination_client_id: str | None
-    envelope_topic: str
-    ack_topic: str
+    relay_topic: str
+    delivery_ack_topic: str
     qos: int
     keepalive: int
     destination_publish_timeout: float
@@ -336,8 +412,8 @@ class BridgeConfig:
         destination_port: int = 1883,
         source_client_id: str | None = None,
         destination_client_id: str | None = None,
-        envelope_topic: str | None = None,
-        ack_topic: str = DEFAULT_ACK_TOPIC,
+        relay_topic: str | None = None,
+        delivery_ack_topic: str | None = None,
         qos: int = 1,
         keepalive: int = 60,
         destination_publish_timeout: float = 2.0,
@@ -349,15 +425,25 @@ class BridgeConfig:
         log_level: int | str | None = None,
         debug: bool = False,
         *,
+        envelope_topic: str | None = None,
         data_topic: str | None = None,
+        ack_topic: str | None = None,
     ) -> None:
-        resolved_envelope_topic = resolve_renamed_argument(
-            new_value=envelope_topic,
-            old_value=data_topic,
-            new_name="envelope_topic",
-            old_name="data_topic",
-            owner="BridgeConfig",
-            default=DEFAULT_ENVELOPE_TOPIC,
+        resolved_relay_topic = resolve_renamed_argument_chain(
+            new_value=relay_topic,
+            new_name="relay_topic",
+            legacy=[(envelope_topic, "envelope_topic"), (data_topic, "data_topic")],
+            owner="RelayConfig",
+            default=DEFAULT_RELAY_TOPIC,
+            error_cls=ConfigError,
+        )
+        resolved_delivery_ack_topic = resolve_renamed_argument(
+            new_value=delivery_ack_topic,
+            old_value=ack_topic,
+            new_name="delivery_ack_topic",
+            old_name="ack_topic",
+            owner="RelayConfig",
+            default=DEFAULT_DELIVERY_ACK_TOPIC,
             error_cls=ConfigError,
         )
         object.__setattr__(self, "source_host", source_host)
@@ -366,8 +452,8 @@ class BridgeConfig:
         object.__setattr__(self, "destination_port", destination_port)
         object.__setattr__(self, "source_client_id", source_client_id)
         object.__setattr__(self, "destination_client_id", destination_client_id)
-        object.__setattr__(self, "envelope_topic", resolved_envelope_topic)
-        object.__setattr__(self, "ack_topic", ack_topic)
+        object.__setattr__(self, "relay_topic", resolved_relay_topic)
+        object.__setattr__(self, "delivery_ack_topic", resolved_delivery_ack_topic)
         object.__setattr__(self, "qos", qos)
         object.__setattr__(self, "keepalive", keepalive)
         object.__setattr__(
@@ -412,13 +498,15 @@ class BridgeConfig:
             _client_id(self.destination_client_id, "destination_client_id"),
         )
         object.__setattr__(
-            self, "envelope_topic", _publish_topic(self.envelope_topic, "envelope_topic")
+            self, "relay_topic", _publish_topic(self.relay_topic, "relay_topic")
         )
         object.__setattr__(
-            self, "ack_topic", _publish_topic(self.ack_topic, "ack_topic")
+            self,
+            "delivery_ack_topic",
+            _publish_topic(self.delivery_ack_topic, "delivery_ack_topic"),
         )
-        if self.envelope_topic == self.ack_topic:
-            raise ConfigError("envelope_topic and ack_topic must be different")
+        if self.relay_topic == self.delivery_ack_topic:
+            raise ConfigError("relay_topic and delivery_ack_topic must be different")
         if (
             self.source_host == self.destination_host
             and self.source_port == self.destination_port
@@ -470,10 +558,41 @@ class BridgeConfig:
         )
 
     @property
-    def data_topic(self) -> str:
-        """Deprecated alias for :attr:`envelope_topic`."""
+    def envelope_topic(self) -> str:
+        """Deprecated (0.2.x) alias for :attr:`relay_topic`."""
 
         warn_deprecated_attribute(
-            owner="BridgeConfig", old_name="data_topic", new_name="envelope_topic"
+            owner="RelayConfig", old_name="envelope_topic", new_name="relay_topic"
         )
-        return self.envelope_topic
+        return self.relay_topic
+
+    @property
+    def data_topic(self) -> str:
+        """Deprecated (0.1.x) alias for :attr:`relay_topic`."""
+
+        warn_deprecated_attribute(
+            owner="RelayConfig", old_name="data_topic", new_name="relay_topic"
+        )
+        return self.relay_topic
+
+    @property
+    def ack_topic(self) -> str:
+        """Deprecated alias for :attr:`delivery_ack_topic`."""
+
+        warn_deprecated_attribute(
+            owner="RelayConfig", old_name="ack_topic", new_name="delivery_ack_topic"
+        )
+        return self.delivery_ack_topic
+
+
+class BridgeConfig(RelayConfig):
+    """Deprecated (0.2.x) alias for :class:`RelayConfig`."""
+
+    def __post_init__(self) -> None:
+        warnings.warn(
+            "BridgeConfig is deprecated and will be removed in a future "
+            "release; use RelayConfig instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        super().__post_init__()
