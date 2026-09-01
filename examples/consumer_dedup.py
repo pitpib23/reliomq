@@ -5,7 +5,7 @@ publish successfully and then fail to deliver its own confirmation, causing
 the source to retry an already-delivered message. This example is a plain
 Paho subscriber -- it is NOT part of reliomq -- showing how any
 final consumer of ReliableMqttBridge's destination messages should use the
-retained `event_id` to make handling idempotent.
+retained `message_id` to make handling idempotent.
 
 Run against the same broker/topic the bridge forwards to:
 
@@ -32,16 +32,16 @@ DESTINATION_TOPIC = "factory/machine1/data"
 # a persistent store (file/db) if the consumer itself must survive restarts
 # without ever reprocessing a message it already handled.
 MAX_REMEMBERED_IDS = 10_000
-_seen_event_ids: "OrderedDict[str, None]" = OrderedDict()
+_seen_message_ids: "OrderedDict[str, None]" = OrderedDict()
 
 
-def already_processed(event_id: str) -> bool:
-    if event_id in _seen_event_ids:
-        _seen_event_ids.move_to_end(event_id)
+def already_processed(message_id: str) -> bool:
+    if message_id in _seen_message_ids:
+        _seen_message_ids.move_to_end(message_id)
         return True
-    _seen_event_ids[event_id] = None
-    if len(_seen_event_ids) > MAX_REMEMBERED_IDS:
-        _seen_event_ids.popitem(last=False)
+    _seen_message_ids[message_id] = None
+    if len(_seen_message_ids) > MAX_REMEMBERED_IDS:
+        _seen_message_ids.popitem(last=False)
     return False
 
 
@@ -58,8 +58,8 @@ def on_message(_client, _userdata, message: mqtt.MQTTMessage) -> None:
         logging.warning("Ignoring malformed delivery on %s: %s", message.topic, error)
         return
 
-    if already_processed(envelope.event_id):
-        logging.info("Duplicate delivery ignored | event_id=%s", envelope.event_id)
+    if already_processed(envelope.message_id):
+        logging.info("Duplicate delivery ignored | message_id=%s", envelope.message_id)
         return
 
     handle_reading(envelope.payload)

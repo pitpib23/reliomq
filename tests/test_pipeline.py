@@ -5,7 +5,7 @@ Every other test file exercises the publisher or the bridge in isolation
 with directly injected ACKs. These tests instead let genuine MQTT-shaped
 callback traffic flow between two live components on real background
 threads, so a regression in how the two halves are meant to interoperate
-(topic names, envelope shape, event_id correlation, retry-on-outage) would
+(topic names, envelope shape, message_id correlation, retry-on-outage) would
 surface here even if each component's own unit tests still passed.
 """
 
@@ -20,12 +20,12 @@ from tempfile import TemporaryDirectory
 from fakes import FakeClient, client_factory_for
 
 from reliomq.bridge import ReliableMqttBridge
-from reliomq.config import BridgeConfig, ReliabilityConfig
+from reliomq.config import BridgeConfig, PublisherConfig
 from reliomq.protocol import DeliveryEnvelope
 from reliomq.publisher import ReliablePublisher
 
 
-DATA_TOPIC = "reliable/pipeline/input"
+ENVELOPE_TOPIC = "reliable/pipeline/input"
 ACK_TOPIC = "reliable/pipeline/ack"
 
 
@@ -44,9 +44,9 @@ class _LinkedBrokerPair:
         bridge_source_client.publish_hook = self._relay_source_ack
 
     def _relay_source_publish(self, call: dict) -> None:
-        if call["topic"] != DATA_TOPIC:
+        if call["topic"] != ENVELOPE_TOPIC:
             return
-        self.bridge_source_client.emit_message(DATA_TOPIC, call["payload"])
+        self.bridge_source_client.emit_message(ENVELOPE_TOPIC, call["payload"])
 
     def _relay_source_ack(self, call: dict) -> None:
         if call["topic"] != ACK_TOPIC:
@@ -68,10 +68,10 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.publisher = ReliablePublisher(
-            ReliabilityConfig(
+            PublisherConfig(
                 host="source-broker",
                 queue_path=self.queue_path,
-                data_topic=DATA_TOPIC,
+                envelope_topic=ENVELOPE_TOPIC,
                 ack_topic=ACK_TOPIC,
                 ack_timeout=0.05,
                 publish_timeout=0.05,
@@ -83,7 +83,7 @@ class PipelineTests(unittest.TestCase):
             BridgeConfig(
                 source_host="source-broker",
                 destination_host="destination-broker",
-                data_topic=DATA_TOPIC,
+                envelope_topic=ENVELOPE_TOPIC,
                 ack_topic=ACK_TOPIC,
                 destination_publish_timeout=0.05,
                 source_ack_publish_timeout=0.05,
@@ -111,13 +111,13 @@ class PipelineTests(unittest.TestCase):
         self.bring_up_publisher()
         self.bring_up_bridge(destination_connected=True)
 
-        event_id = self.publisher.publish(
+        message_id = self.publisher.publish(
             topic="factory/machine1/data",
             payload={"temperature": 25.2, "pressure": 4.1},
-            event_id="pipeline-happy-path",
+            message_id="pipeline-happy-path",
         )
 
-        self.assertTrue(self.publisher.wait_for_delivery(event_id, timeout=5.0))
+        self.assertTrue(self.publisher.wait_for_delivery(message_id, timeout=5.0))
         self.assertEqual(self.publisher.pending_count(), 0)
 
         self.assertEqual(len(self.bridge_dest_client.publish_calls), 1)
@@ -125,7 +125,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(destination_call["topic"], "factory/machine1/data")
         self.assertEqual(destination_call["qos"], 1)
         delivered = DeliveryEnvelope.from_bytes(destination_call["payload"])
-        self.assertEqual(delivered.event_id, event_id)
+        self.assertEqual(delivered.message_id, message_id)
         self.assertEqual(delivered.payload, {"temperature": 25.2, "pressure": 4.1})
 
     def test_destination_outage_retries_and_recovers_without_losing_the_message(
@@ -136,10 +136,10 @@ class PipelineTests(unittest.TestCase):
         # ACK, and the publisher must keep the durable record and retry.
         self.bring_up_bridge(destination_connected=False)
 
-        event_id = self.publisher.publish(
+        message_id = self.publisher.publish(
             topic="factory/machine1/data",
             payload={"temperature": 99.9},
-            event_id="pipeline-outage",
+            message_id="pipeline-outage",
         )
 
         # Give the retry loop a few cycles to prove the message survives an
@@ -154,26 +154,26 @@ class PipelineTests(unittest.TestCase):
 
         threading.Thread(target=reconnect_destination_soon, daemon=True).start()
 
-        self.assertTrue(self.publisher.wait_for_delivery(event_id, timeout=5.0))
+        self.assertTrue(self.publisher.wait_for_delivery(message_id, timeout=5.0))
         self.assertEqual(self.publisher.pending_count(), 0)
         self.assertEqual(len(self.bridge_dest_client.publish_calls), 1)
         delivered = DeliveryEnvelope.from_bytes(
             self.bridge_dest_client.publish_calls[0]["payload"]
         )
-        self.assertEqual(delivered.event_id, event_id)
+        self.assertEqual(delivered.message_id, message_id)
 
     def test_two_messages_are_delivered_in_fifo_order_through_the_bridge(self) -> None:
         self.bring_up_publisher()
         self.bring_up_bridge(destination_connected=True)
 
-        first = self.publisher.publish("factory/a", 1, event_id="pipeline-fifo-1")
-        second = self.publisher.publish("factory/b", 2, event_id="pipeline-fifo-2")
+        first = self.publisher.publish("factory/a", 1, message_id="pipeline-fifo-1")
+        second = self.publisher.publish("factory/b", 2, message_id="pipeline-fifo-2")
 
         self.assertTrue(self.publisher.wait_for_delivery(timeout=5.0))
         self.assertEqual(self.publisher.pending_count(), 0)
 
         delivered_ids = [
-            DeliveryEnvelope.from_bytes(call["payload"]).event_id
+            DeliveryEnvelope.from_bytes(call["payload"]).message_id
             for call in self.bridge_dest_client.publish_calls
         ]
         self.assertEqual(delivered_ids, [first, second])

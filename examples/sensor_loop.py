@@ -11,7 +11,9 @@ recommended for long-running services:
   polling wait_for_delivery() per reading, which would serialize readings
   behind network round trips;
 - stop() on SIGINT/SIGTERM leaves any in-flight message durably queued for
-  the next run instead of losing it.
+  the next run instead of losing it;
+- `log_level="INFO"` on the config gives a running narration of connects,
+  queued readings, and confirmed deliveries with zero `logging` setup.
 
 Run against a local broker for a real trial:
 
@@ -26,10 +28,8 @@ import signal
 import threading
 import time
 
-from reliomq import ReliabilityConfig, ReliablePublisher
+from reliomq import PublisherConfig, ReliablePublisher
 
-
-logging.basicConfig(level=logging.INFO)
 
 READING_INTERVAL_SECONDS = 5.0
 PENDING_WARNING_THRESHOLD = 20
@@ -42,14 +42,15 @@ def read_sensor() -> dict:
 
 
 def main() -> None:
-    config = ReliabilityConfig(
+    config = PublisherConfig(
         host="localhost",
         port=1883,
         queue_path="sensor_pending.jsonl",
-        data_topic="reliable/ingress",
+        envelope_topic="reliable/ingress",
         ack_topic="reliable/acks",
         ack_timeout=3.0,
         retry_interval=10.0,
+        log_level="INFO",
     )
 
     publisher = ReliablePublisher(config)
@@ -66,19 +67,24 @@ def main() -> None:
     except (AttributeError, ValueError):
         pass  # SIGTERM is not available on every platform/thread.
 
+    # This app-level warning is separate from reliomq's own INFO logging
+    # above; use the standard library the same way you would for any other
+    # part of your application.
+    app_logger = logging.getLogger(__name__)
+
     try:
         while not shutdown_requested.is_set():
             reading = read_sensor()
-            event_id = publisher.publish(
+            message_id = publisher.publish(
                 topic="factory/machine1/temperature", payload=reading
             )
 
             pending = publisher.pending_count()
             if pending >= PENDING_WARNING_THRESHOLD:
-                logging.warning(
+                app_logger.warning(
                     "Delivery is falling behind | pending=%s | latest=%s",
                     pending,
-                    event_id,
+                    message_id,
                 )
 
             shutdown_requested.wait(timeout=READING_INTERVAL_SECONDS)

@@ -1,7 +1,7 @@
 """End-to-end MQTT forwarding with application-level acknowledgements.
 
 The bridge deliberately has no durable queue of its own.  A source
-``ReliableMqttPublisher`` retains each message until this bridge confirms the
+``ReliablePublisher`` retains each message until this bridge confirms the
 destination QoS 1 publication and then publishes the correlated source ACK.
 If any step fails, no ACK is sent and the source publisher remains responsible
 for retrying the durable message.
@@ -26,6 +26,7 @@ from .mqtt import (
     reason_code_is_success,
     suback_is_success,
 )
+from .observability import enable_logging
 from .protocol import Ack, DeliveryEnvelope, MessageEnvelope, ProtocolError
 
 
@@ -40,6 +41,15 @@ def _generated_client_id(role: str) -> str:
 
 class ReliableMqttBridge:
     """Forward reliable envelopes and ACK only confirmed destination delivery.
+
+    Sits between two brokers: it subscribes to a source publisher's envelope
+    topic, republishes each message's payload to its real application topic
+    on the destination broker, and -- only once that destination publish is
+    QoS 1 confirmed -- publishes an :class:`~reliomq.protocol.Ack` back to
+    the source so the publisher can retire its durable record. If any step
+    fails (either broker offline, a malformed envelope, a full internal
+    queue, a timeout, or shutdown), no ACK is sent, and the source publisher
+    keeps its durable copy and retries.
 
     One worker serializes all destination publishes.  Its in-memory queue is
     intentionally bounded and non-durable: dropping or abandoning a bridge
@@ -61,6 +71,9 @@ class ReliableMqttBridge:
     ) -> None:
         if not isinstance(config, BridgeConfig):
             raise TypeError("config must be a BridgeConfig")
+
+        if config.log_level is not None:
+            enable_logging(config.log_level)
 
         self.config = config
         self._logger = bridge_logger or logger
@@ -118,6 +131,17 @@ class ReliableMqttBridge:
         self._running = False
         self._worker: threading.Thread | None = None
 
+        self._logger.info(
+            "Bridge initialized | source=%s:%s | destination=%s:%s | "
+            "envelope_topic=%s | ack_topic=%s",
+            config.source_host,
+            config.source_port,
+            config.destination_host,
+            config.destination_port,
+            config.envelope_topic,
+            config.ack_topic,
+        )
+
     # ------------------------------------------------------------------
     # Connection and subscription callbacks
     # ------------------------------------------------------------------
@@ -144,7 +168,7 @@ class ReliableMqttBridge:
 
         self._source_connected.set()
         self._logger.info(
-            "Source broker connected | broker=%s:%s",
+            "Source broker connection established | broker=%s:%s",
             self.config.source_host,
             self.config.source_port,
         )
@@ -202,15 +226,17 @@ class ReliableMqttBridge:
 
         source = client or self.source_client
         try:
-            result, message_id = source.subscribe(
-                self.config.data_topic, qos=self.config.qos
+            # `mid` is Paho's MQTT packet identifier for this SUBSCRIBE
+            # request -- unrelated to a reliomq message_id.
+            result, mid = source.subscribe(
+                self.config.envelope_topic, qos=self.config.qos
             )
         except Exception:
             with self._subscription_lock:
                 self._subscription_mid = None
             self._logger.exception(
                 "Source subscription request failed | topic=%s",
-                self.config.data_topic,
+                self.config.envelope_topic,
             )
             return
 
@@ -219,7 +245,7 @@ class ReliableMqttBridge:
                 self._subscription_mid = None
                 self._logger.warning(
                     "Source subscription request rejected | topic=%s | rc=%s",
-                    self.config.data_topic,
+                    self.config.envelope_topic,
                     result,
                 )
                 return
@@ -227,20 +253,20 @@ class ReliableMqttBridge:
             # A synchronous SUBACK has already cleared the sentinel and set
             # readiness; do not overwrite that completed state.
             if self._subscription_mid == -1:
-                self._subscription_mid = message_id
+                self._subscription_mid = mid
 
     def _on_source_subscribe(
         self,
         _client: mqtt.Client,
         _userdata: Any,
-        message_id: int,
+        mid: int,
         reason_codes: Any,
         _properties: Any,
     ) -> None:
         with self._subscription_lock:
-            if self._subscription_mid not in (-1, message_id):
+            if self._subscription_mid not in (-1, mid):
                 self._logger.debug(
-                    "Ignoring unexpected source SUBACK | mid=%s", message_id
+                    "Ignoring unexpected source SUBACK | mid=%s", mid
                 )
                 return
             self._subscription_mid = None
@@ -257,13 +283,13 @@ class ReliableMqttBridge:
         if ready:
             self._source_subscription_ready.set()
             self._logger.info(
-                "Source subscription ready | topic=%s", self.config.data_topic
+                "Source subscription ready | topic=%s", self.config.envelope_topic
             )
         else:
             self._source_subscription_ready.clear()
             self._logger.warning(
                 "Source subscription rejected | topic=%s | reasons=%s",
-                self.config.data_topic,
+                self.config.envelope_topic,
                 reason_codes,
             )
 
@@ -294,7 +320,7 @@ class ReliableMqttBridge:
             return
         self._destination_connected.set()
         self._logger.info(
-            "Destination broker connected | broker=%s:%s",
+            "Destination broker connection established | broker=%s:%s",
             self.config.destination_host,
             self.config.destination_port,
         )
@@ -335,7 +361,7 @@ class ReliableMqttBridge:
             # closed if a broker/client behaves unexpectedly during reconnect.
             self._logger.warning("Ignoring source message before subscription ready")
             return
-        if message.topic != self.config.data_topic:
+        if message.topic != self.config.envelope_topic:
             self._logger.warning("Ignoring unexpected source topic %s", message.topic)
             return
 
@@ -368,14 +394,14 @@ class ReliableMqttBridge:
             except queue.Full:
                 self._logger.error(
                     "Bridge queue full; source message left unacknowledged | "
-                    "event_id=%s",
-                    envelope.event_id,
+                    "message_id=%s",
+                    envelope.message_id,
                 )
                 return
 
         self._logger.debug(
-            "Source message queued | event_id=%s | depth=%s",
-            envelope.event_id,
+            "Source message queued | message_id=%s | depth=%s",
+            envelope.message_id,
             self._tasks.qsize(),
         )
 
@@ -402,27 +428,33 @@ class ReliableMqttBridge:
 
         if not isinstance(envelope, MessageEnvelope):
             raise TypeError("envelope must be a MessageEnvelope")
+        message_id = envelope.message_id
         if not self._client_is_connected(
             self.destination_client, self._destination_connected
         ):
             self._logger.debug(
-                "Destination unavailable; no ACK sent | event_id=%s",
-                envelope.event_id,
+                "Destination unavailable; no ACK sent | message_id=%s",
+                message_id,
             )
             return False
 
         try:
             delivery_payload = DeliveryEnvelope(
-                event_id=envelope.event_id,
+                message_id=message_id,
                 payload=envelope.payload,
             ).to_bytes()
         except Exception:
             self._logger.exception(
-                "Could not encode destination envelope; no ACK sent | event_id=%s",
-                envelope.event_id,
+                "Could not encode destination envelope; no ACK sent | message_id=%s",
+                message_id,
             )
             return False
 
+        self._logger.debug(
+            "Forwarding to destination | message_id=%s | topic=%s",
+            message_id,
+            envelope.topic,
+        )
         if not confirmed_publish(
             self.destination_client,
             envelope.topic,
@@ -432,11 +464,13 @@ class ReliableMqttBridge:
             timeout=self.config.destination_publish_timeout,
         ):
             self._logger.warning(
-                "Destination publish failed; no ACK sent | event_id=%s | topic=%s",
-                envelope.event_id,
+                "Destination publish failed; no ACK sent | message_id=%s | topic=%s",
+                message_id,
                 envelope.topic,
             )
             return False
+
+        self._logger.debug("Destination publish confirmed | message_id=%s", message_id)
 
         # From this point a source retry can duplicate the remote delivery.
         # That is the deliberate at-least-once tradeoff if ACK publication
@@ -444,16 +478,16 @@ class ReliableMqttBridge:
         if not self._client_is_connected(self.source_client, self._source_connected):
             self._logger.warning(
                 "Source unavailable after destination success; no ACK sent | "
-                "event_id=%s",
-                envelope.event_id,
+                "message_id=%s",
+                message_id,
             )
             return False
 
         try:
-            ack_payload = Ack(event_id=envelope.event_id).to_bytes()
+            ack_payload = Ack(message_id=message_id).to_bytes()
         except Exception:
             self._logger.exception(
-                "Could not encode source ACK | event_id=%s", envelope.event_id
+                "Could not encode source ACK | message_id=%s", message_id
             )
             return False
 
@@ -466,19 +500,16 @@ class ReliableMqttBridge:
             timeout=self.config.source_ack_publish_timeout,
         ):
             self._logger.warning(
-                "Source ACK publish failed | event_id=%s", envelope.event_id
+                "Source ACK publish failed | message_id=%s", message_id
             )
             return False
 
-        self._logger.debug(
-            "Destination delivery and source ACK confirmed | event_id=%s",
-            envelope.event_id,
+        self._logger.info(
+            "Forwarded and acknowledged | message_id=%s | destination_topic=%s",
+            message_id,
+            envelope.topic,
         )
         return True
-
-    # A concise alias is useful for tests and callers familiar with the
-    # original forwarder terminology.
-    _forward = _forward_once
 
     def _worker_main(self) -> None:
         poll_seconds = min(0.5, self.config.retry_interval)
@@ -513,6 +544,7 @@ class ReliableMqttBridge:
     def _connect_and_start_loop(
         self, client: mqtt.Client, host: str, port: int
     ) -> None:
+        self._logger.info("Connecting to broker | host=%s | port=%s", host, port)
         connect_result = client.connect_async(host, port, self.config.keepalive)
         if not self._successful_start_result(connect_result):
             raise RuntimeError(
@@ -531,6 +563,13 @@ class ReliableMqttBridge:
         with self._lifecycle_lock:
             if self._running:
                 return self
+            self._logger.info(
+                "Bridge starting | source=%s:%s | destination=%s:%s",
+                self.config.source_host,
+                self.config.source_port,
+                self.config.destination_host,
+                self.config.destination_port,
+            )
             self._running = True
             self._stop_event.clear()
             with self._intake_lock:
@@ -561,7 +600,7 @@ class ReliableMqttBridge:
             self.stop()
             raise
 
-        self._logger.info("Reliable MQTT bridge started")
+        self._logger.info("Bridge started")
         return self
 
     def stop(self) -> None:
@@ -575,6 +614,9 @@ class ReliableMqttBridge:
         with self._lifecycle_lock:
             if not self._running:
                 return
+            self._logger.info(
+                "Bridge stopping | queued=%s", self._tasks.qsize()
+            )
             self._running = False
             with self._intake_lock:
                 self._accepting.clear()
@@ -634,7 +676,7 @@ class ReliableMqttBridge:
         with self._lifecycle_lock:
             self._worker = None
 
-        self._logger.info("Reliable MQTT bridge stopped")
+        self._logger.info("Bridge stopped")
 
     close = stop
 

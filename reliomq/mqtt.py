@@ -35,7 +35,9 @@ def create_client(
     """Create a client through an injectable keyword-based factory."""
 
     factory = client_factory or default_client_factory
-    return factory(client_id=client_id, userdata=userdata)
+    client = factory(client_id=client_id, userdata=userdata)
+    logger.debug("MQTT client created | client_id=%s", client_id)
+    return client
 
 
 def reason_code_is_success(reason_code: Any) -> bool:

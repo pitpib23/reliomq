@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .protocol import MessageEnvelope, ProtocolError, validate_event_id
+from ._compat import resolve_renamed_argument
+from .protocol import MessageEnvelope, ProtocolError, validate_message_id
 
 
 class StoreError(RuntimeError):
@@ -25,10 +26,22 @@ class _StoredRecord:
 
 
 class DurableMessageStore:
-    """A thread-safe, append-and-rewrite JSONL queue.
+    """A crash-safe, on-disk FIFO queue of pending :class:`MessageEnvelope`.
 
-    Synchronization is process-local. Applications must not have multiple
-    processes write the same queue file concurrently.
+    Used internally by :class:`~reliomq.publisher.ReliablePublisher`, and
+    safe to use directly if you want to inspect or manage the durable queue
+    outside of a running publisher (for example, a maintenance script).
+
+    Every :meth:`append` is durable before it returns: the record is
+    flushed and ``fsync``'d to disk, so a crash immediately afterward cannot
+    lose it. :meth:`remove_oldest` is the only way a record leaves the
+    queue, and it only succeeds when the envelope you pass in is an exact
+    match for the current oldest record -- this is what keeps FIFO order and
+    ACK correlation trustworthy even across a restart.
+
+    Synchronization is process-local (one :class:`threading.RLock` guards
+    every operation). Applications must not have multiple *processes* write
+    the same queue file concurrently.
     """
 
     def __init__(
@@ -47,6 +60,10 @@ class DurableMessageStore:
         self._logger = logger or logging.getLogger(__name__)
         self._lock = threading.RLock()
 
+        self._logger.info(
+            "Durable store opened | path=%s | pending=%s", self._path, self.size()
+        )
+
     @property
     def path(self) -> Path:
         return self._path
@@ -61,9 +78,13 @@ class DurableMessageStore:
             records = self._read_records()
             if any(
                 record.envelope is not None
-                and record.envelope.event_id == envelope.event_id
+                and record.envelope.message_id == envelope.message_id
                 for record in records
             ):
+                self._logger.debug(
+                    "Append skipped; message_id already pending | message_id=%s",
+                    envelope.message_id,
+                )
                 return False
 
             self._ensure_parent_directory()
@@ -88,6 +109,11 @@ class DurableMessageStore:
 
             if created:
                 self._fsync_parent_directory()
+            self._logger.debug(
+                "Message durably appended | message_id=%s | topic=%s",
+                envelope.message_id,
+                envelope.topic,
+            )
             return True
 
     def load(self) -> list[MessageEnvelope]:
@@ -136,6 +162,11 @@ class DurableMessageStore:
                 if index != oldest_index
             ]
             self._atomic_rewrite(remaining)
+            self._logger.debug(
+                "Persisted message removed | message_id=%s | remaining=%s",
+                expected.message_id,
+                len(remaining),
+            )
             return True
 
     def size(self) -> int:
@@ -144,15 +175,28 @@ class DurableMessageStore:
         with self._lock:
             return sum(1 for record in self._read_records() if record.pending)
 
-    def contains(self, event_id: str) -> bool:
-        """Return whether a valid pending record has ``event_id``."""
+    def contains(
+        self,
+        message_id: str | None = None,
+        *,
+        event_id: str | None = None,
+    ) -> bool:
+        """Return whether a valid pending record has ``message_id``."""
 
-        validate_event_id(event_id)
+        resolved_id = resolve_renamed_argument(
+            new_value=message_id,
+            old_value=event_id,
+            new_name="message_id",
+            old_name="event_id",
+            owner="DurableMessageStore.contains",
+            default="",
+        )
+        validate_message_id(resolved_id)
         with self._lock:
             return any(
                 record.pending
                 and record.envelope is not None
-                and record.envelope.event_id == event_id
+                and record.envelope.message_id == resolved_id
                 for record in self._read_records()
             )
 
@@ -174,7 +218,7 @@ class DurableMessageStore:
             raise StoreError(f"cannot read queue {self._path}: {error}") from error
 
         records: list[_StoredRecord] = []
-        seen_event_ids: set[str] = set()
+        seen_message_ids: set[str] = set()
         for line_number, raw in enumerate(raw_records, start=1):
             try:
                 envelope = MessageEnvelope.from_bytes(raw)
@@ -188,16 +232,16 @@ class DurableMessageStore:
                 records.append(_StoredRecord(raw=raw, envelope=None, pending=False))
                 continue
 
-            pending = envelope.event_id not in seen_event_ids
+            pending = envelope.message_id not in seen_message_ids
             if pending:
-                seen_event_ids.add(envelope.event_id)
+                seen_message_ids.add(envelope.message_id)
             else:
                 self._logger.warning(
-                    "Skipping duplicate durable queue event ID | path=%s | "
-                    "line=%s | event_id=%s",
+                    "Skipping duplicate durable queue message_id | path=%s | "
+                    "line=%s | message_id=%s",
                     self._path,
                     line_number,
-                    envelope.event_id,
+                    envelope.message_id,
                 )
             records.append(
                 _StoredRecord(raw=raw, envelope=envelope, pending=pending)

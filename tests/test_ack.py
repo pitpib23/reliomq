@@ -52,7 +52,7 @@ class AckTrackerTests(unittest.TestCase):
         tracker.wait(timeout=1.0)
         tracker.end()
 
-        self.assertIsNone(tracker.expected_event_id)
+        self.assertIsNone(tracker.expected_message_id)
         self.assertFalse(tracker.match("event-1"))
 
     def test_ack_arriving_after_timeout_boundary_is_not_reported_as_matched(self) -> None:
@@ -71,7 +71,7 @@ class AckTrackerTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             tracker.begin("event-2")
 
-    def test_begin_rejects_empty_or_non_string_event_id(self) -> None:
+    def test_begin_rejects_empty_or_non_string_message_id(self) -> None:
         tracker = AckTracker()
         for value in ("", None, 123):
             with self.subTest(value=value), self.assertRaises(ValueError):
@@ -93,12 +93,12 @@ class AckTrackerTests(unittest.TestCase):
         tracker.begin("winner")
         results: list[bool] = []
 
-        def fire(event_id: str) -> None:
-            results.append(tracker.match(event_id))
+        def fire(message_id: str) -> None:
+            results.append(tracker.match(message_id))
 
         threads = [
-            threading.Thread(target=fire, args=(eid,))
-            for eid in ("loser-a", "winner", "loser-b")
+            threading.Thread(target=fire, args=(candidate_id,))
+            for candidate_id in ("loser-a", "winner", "loser-b")
         ]
         for thread in threads:
             thread.start()

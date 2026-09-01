@@ -1,4 +1,10 @@
-"""Thread-safe correlation for one in-flight application acknowledgement."""
+"""Thread-safe correlation for one in-flight application acknowledgement.
+
+Internal to :class:`~reliomq.publisher.ReliablePublisher`: not part of the
+public API, so its ``message_id`` parameter was not given a deprecated
+``event_id`` alias -- there is nothing outside this package that constructs
+or calls an :class:`AckTracker` directly.
+"""
 
 from __future__ import annotations
 
@@ -17,41 +23,41 @@ class AckTracker:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._event = threading.Event()
-        self._expected_event_id: str | None = None
+        self._expected_message_id: str | None = None
         self._matched = False
         self._interrupted = False
 
-    def begin(self, event_id: str) -> None:
-        """Begin waiting for ``event_id``.
+    def begin(self, message_id: str) -> None:
+        """Begin waiting for ``message_id``.
 
         Raises:
-            ValueError: If ``event_id`` is empty or is not a string.
+            ValueError: If ``message_id`` is empty or is not a string.
             RuntimeError: If another expectation is already active.
         """
 
-        if not isinstance(event_id, str) or not event_id:
-            raise ValueError("event_id must be a non-empty string")
+        if not isinstance(message_id, str) or not message_id:
+            raise ValueError("message_id must be a non-empty string")
 
         with self._lock:
-            if self._expected_event_id is not None:
+            if self._expected_message_id is not None:
                 raise RuntimeError("an ACK expectation is already active")
             self._event.clear()
-            self._expected_event_id = event_id
+            self._expected_message_id = message_id
             self._matched = False
             self._interrupted = False
 
-    def match(self, event_id: str) -> bool:
+    def match(self, message_id: str) -> bool:
         """Record a matching ACK and wake the waiter.
 
-        Wrong, stale, and late event IDs return ``False`` without changing the
-        active expectation.
+        Wrong, stale, and late message IDs return ``False`` without changing
+        the active expectation.
         """
 
         with self._lock:
             matched = (
-                self._expected_event_id is not None
+                self._expected_message_id is not None
                 and not self._interrupted
-                and event_id == self._expected_event_id
+                and message_id == self._expected_message_id
             )
             if matched:
                 self._matched = True
@@ -80,14 +86,14 @@ class AckTracker:
         """Clear the active expectation so subsequent ACKs are considered late."""
 
         with self._lock:
-            self._expected_event_id = None
+            self._expected_message_id = None
             self._matched = False
             self._interrupted = False
             self._event.clear()
 
     @property
-    def expected_event_id(self) -> str | None:
+    def expected_message_id(self) -> str | None:
         """Return the current expected ID, primarily for diagnostics."""
 
         with self._lock:
-            return self._expected_event_id
+            return self._expected_message_id

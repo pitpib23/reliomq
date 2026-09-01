@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 from reliomq.protocol import MessageEnvelope
@@ -10,7 +11,7 @@ from reliomq.store import DurableMessageStore, StoreError
 
 def message(number: int) -> MessageEnvelope:
     return MessageEnvelope(
-        event_id=f"event-{number}",
+        message_id=f"event-{number}",
         topic="factory/data",
         payload={"sequence": number},
     )
@@ -43,7 +44,7 @@ class DurableMessageStoreTests(unittest.TestCase):
         self.store.append(second)
 
         changed_first = MessageEnvelope(
-            event_id=first.event_id,
+            message_id=first.message_id,
             topic=first.topic,
             payload={"sequence": 999},
         )
@@ -51,10 +52,10 @@ class DurableMessageStoreTests(unittest.TestCase):
         self.assertFalse(self.store.remove_oldest(changed_first))
         self.assertEqual(self.store.load(), [first, second])
 
-    def test_duplicate_pending_event_id_is_not_appended(self) -> None:
+    def test_duplicate_pending_message_id_is_not_appended(self) -> None:
         first = message(1)
         conflicting = MessageEnvelope(
-            event_id=first.event_id,
+            message_id=first.message_id,
             topic="other/topic",
             payload="different",
         )
@@ -93,7 +94,33 @@ class DurableMessageStoreTests(unittest.TestCase):
         with self.assertRaises(StoreError):
             self.store.size()
 
+    def test_opening_a_store_logs_the_pending_count(self) -> None:
+        self.store.append(message(1))
+
+        with self.assertLogs("reliomq.store", level="INFO") as captured:
+            DurableMessageStore(self.path)
+
+        self.assertTrue(
+            any("Durable store opened" in line and "pending=1" in line for line in captured.output)
+        )
+
+    def test_contains_accepts_message_id_positionally(self) -> None:
+        self.store.append(message(1))
+
+        self.assertTrue(self.store.contains("event-1"))
+        self.assertFalse(self.store.contains("event-missing"))
+
+    def test_contains_event_id_keyword_still_works_and_warns(self) -> None:
+        self.store.append(message(1))
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertTrue(self.store.contains(event_id="event-1"))
+
+        self.assertTrue(
+            any(issubclass(w.category, DeprecationWarning) for w in caught)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
-

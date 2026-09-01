@@ -1,7 +1,7 @@
 """Injecting TLS and username/password auth via a custom client factory.
 
 reliomq never reads credentials or certificate paths from its own
-config objects -- ReliabilityConfig/BridgeConfig only describe reliability
+config objects -- PublisherConfig/BridgeConfig only describe reliability
 behavior (topics, timeouts, queue path). Connection-security concerns are
 applied to the underlying Paho client through an injectable factory, using
 the same construction hook the test suite uses to inject fakes.
@@ -13,7 +13,7 @@ import ssl
 
 import paho.mqtt.client as mqtt
 
-from reliomq import ReliabilityConfig, ReliablePublisher
+from reliomq import PublisherConfig, ReliablePublisher
 
 
 def make_tls_client(*, client_id: str, userdata=None) -> mqtt.Client:
@@ -31,11 +31,11 @@ def make_tls_client(*, client_id: str, userdata=None) -> mqtt.Client:
     return client
 
 
-config = ReliabilityConfig(
+config = PublisherConfig(
     host="mqtt.example.net",
     port=8883,
     queue_path="mqtt_pending.jsonl",
-    data_topic="reliable/ingress",
+    envelope_topic="reliable/ingress",
     ack_topic="reliable/acks",
 )
 

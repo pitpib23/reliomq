@@ -11,8 +11,9 @@ from typing import Any
 
 import paho.mqtt.client as mqtt
 
+from ._compat import resolve_renamed_argument
 from .ack import AckTracker
-from .config import ReliabilityConfig
+from .config import PublisherConfig
 from .mqtt import (
     ClientFactory,
     confirmed_publish,
@@ -20,6 +21,7 @@ from .mqtt import (
     reason_code_is_success,
     suback_is_success,
 )
+from .observability import enable_logging
 from .protocol import Ack, MessageEnvelope, ProtocolError
 from .store import DurableMessageStore, StoreError
 
@@ -41,22 +43,45 @@ class DeliveryStatus(str, Enum):
 class ReliablePublisher:
     """Publish JSON messages with durable FIFO retry and correlated ACKs.
 
-    Every call to :meth:`publish` writes the complete message envelope to the
-    durable queue before returning.  A single worker always selects the oldest
-    stored envelope, so live messages cannot overtake recovery traffic.  The
-    envelope remains stored until both the QoS 1 source publish and its
-    application-level ACK have been confirmed.
+    This is reliomq's main entry point. Every call to :meth:`publish` writes
+    the complete message envelope to the durable queue *before returning* --
+    a crash the instant after ``publish()`` returns cannot lose the message.
+    One background worker always selects the oldest stored envelope, so a
+    live message can never overtake recovery traffic from a previous crash
+    or outage. The envelope stays in the durable queue until **both** the
+    QoS 1 MQTT publish to the broker *and* an application-level ACK
+    (published back by a :class:`~reliomq.bridge.ReliableMqttBridge`, or by
+    your own code speaking the same wire protocol) have been confirmed --
+    an MQTT PUBACK alone is never treated as "delivered."
+
+    Typical usage::
+
+        config = PublisherConfig(
+            host="localhost",
+            queue_path="pending.jsonl",
+            debug=True,  # see reliomq's INFO/DEBUG logs with zero setup
+        )
+        with ReliablePublisher(config) as publisher:
+            message_id = publisher.publish(
+                topic="factory/machine1/data",
+                payload={"temperature": 25.2},
+            )
+            publisher.wait_for_delivery(message_id, timeout=10.0)
+
+    ``start()``/``stop()`` are idempotent and safe to call from any thread.
+    A stopped instance may be started again -- all pending envelopes remain
+    in the same durable store, so no message is lost across restarts.
     """
 
     def __init__(
         self,
-        config: ReliabilityConfig,
+        config: PublisherConfig,
         *,
         client_factory: ClientFactory | None = None,
         store: DurableMessageStore | None = None,
     ) -> None:
-        if not isinstance(config, ReliabilityConfig):
-            raise TypeError("config must be a ReliabilityConfig")
+        if not isinstance(config, PublisherConfig):
+            raise TypeError("config must be a PublisherConfig")
         if store is not None and not isinstance(store, DurableMessageStore):
             # Tests and applications may provide a compatible store double;
             # structural validation below gives it a useful error message.
@@ -70,6 +95,9 @@ class ReliablePublisher:
             )
             if any(not callable(getattr(store, name, None)) for name in required):
                 raise TypeError("store must implement the DurableMessageStore API")
+
+        if config.log_level is not None:
+            enable_logging(config.log_level)
 
         self.config = config
         self.store = (
@@ -111,6 +139,20 @@ class ReliablePublisher:
         self._worker: threading.Thread | None = None
         self._started = False
         self._loop_started = False
+        self._connection_count = 0
+
+        # In-memory only, purely for diagnostics: how many times the current
+        # durable head has been retried, keyed by message_id. Never
+        # persisted, never read back, and never affects delivery decisions
+        # -- popped on success so it cannot grow past the queue depth.
+        self._retry_attempts: dict[str, int] = {}
+
+        logger.info(
+            "Publisher initialized | broker=%s:%s | queue_path=%s",
+            config.host,
+            config.port,
+            self.store.path,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -139,6 +181,9 @@ class ReliablePublisher:
                 self._subscription_mid = None
                 self._next_subscription_attempt = 0.0
 
+            logger.info(
+                "Connecting to broker | host=%s | port=%s", self.config.host, self.config.port
+            )
             connect_result = self.client.connect_async(
                 self.config.host,
                 self.config.port,
@@ -162,11 +207,17 @@ class ReliablePublisher:
             self._wakeup.set()
 
         logger.info(
-            "Reliable publisher started | broker=%s:%s | pending=%s",
+            "Publisher started | broker=%s:%s | pending=%s",
             self.config.host,
             self.config.port,
             pending,
         )
+        if pending:
+            logger.info(
+                "Restored %s pending message(s) from a previous run | queue_path=%s",
+                pending,
+                self.store.path,
+            )
         return self
 
     def publish(
@@ -174,24 +225,34 @@ class ReliablePublisher:
         topic: str,
         payload: Any,
         *,
+        message_id: str | None = None,
         event_id: str | None = None,
     ) -> str:
         """Durably enqueue a JSON-compatible payload and return its stable ID.
 
         The call is safe before :meth:`start`; delivery begins when the
         publisher starts.  Repeating an identical message with the same
-        explicit ID is idempotent.  Reusing a pending ID for different content
-        raises ``ValueError``.
+        explicit ``message_id`` is idempotent.  Reusing a pending ID for
+        different content raises ``ValueError``.
         """
 
-        if event_id is None:
-            envelope = MessageEnvelope(topic=topic, payload=payload)
-        else:
-            envelope = MessageEnvelope(
-                event_id=event_id,
+        resolved_message_id = resolve_renamed_argument(
+            new_value=message_id,
+            old_value=event_id,
+            new_name="message_id",
+            old_name="event_id",
+            owner="ReliablePublisher.publish",
+            default="",
+        )
+        envelope = (
+            MessageEnvelope(topic=topic, payload=payload)
+            if not resolved_message_id
+            else MessageEnvelope(
+                message_id=resolved_message_id,
                 topic=topic,
                 payload=payload,
             )
+        )
 
         with self._publish_lock:
             appended = self.store.append(envelope)
@@ -200,7 +261,7 @@ class ReliablePublisher:
                     (
                         queued
                         for queued in self.store.load()
-                        if queued.event_id == envelope.event_id
+                        if queued.message_id == envelope.message_id
                     ),
                     None,
                 )
@@ -209,17 +270,18 @@ class ReliablePublisher:
                     or existing.to_bytes() != envelope.to_bytes()
                 ):
                     raise ValueError(
-                        f"event_id {envelope.event_id!r} is already pending "
+                        f"message_id {envelope.message_id!r} is already pending "
                         "with different content"
                     )
 
         self._wakeup.set()
-        logger.debug(
-            "Message durably queued | event_id=%s | topic=%s",
-            envelope.event_id,
+        logger.info(
+            "Message accepted and durably queued | message_id=%s | topic=%s | pending=%s",
+            envelope.message_id,
             envelope.topic,
+            self.store.size(),
         )
-        return envelope.event_id
+        return envelope.message_id
 
     def pending_count(self) -> int:
         """Return the number of valid messages currently awaiting delivery."""
@@ -228,15 +290,26 @@ class ReliablePublisher:
 
     def wait_for_delivery(
         self,
-        event_id: str | None = None,
+        message_id: str | None = None,
         timeout: float | None = None,
+        *,
+        event_id: str | None = None,
     ) -> bool:
-        """Wait for one event, or for the whole queue when ``event_id`` is None.
+        """Wait for one message, or the whole queue when ``message_id`` is None.
 
         ``False`` means the timeout expired or the publisher stopped while the
         requested message(s) remained pending.  Store failures propagate as
         :class:`StoreError` rather than being reported as successful delivery.
         """
+
+        resolved_message_id = resolve_renamed_argument(
+            new_value=message_id,
+            old_value=event_id,
+            new_name="message_id",
+            old_name="event_id",
+            owner="ReliablePublisher.wait_for_delivery",
+            default="",
+        ) or None
 
         if timeout is not None and timeout < 0:
             raise ValueError("timeout must be non-negative or None")
@@ -249,8 +322,8 @@ class ReliablePublisher:
             with self._delivery_condition:
                 pending = (
                     self.store.size() > 0
-                    if event_id is None
-                    else self.store.contains(event_id)
+                    if resolved_message_id is None
+                    else self.store.contains(resolved_message_id)
                 )
                 if not pending:
                     return True
@@ -265,11 +338,13 @@ class ReliablePublisher:
                 self._delivery_condition.wait(timeout=remaining)
 
     def stop(self) -> None:
-        """Stop cleanly without removing or regenerating the in-flight event."""
+        """Stop cleanly without removing or regenerating the in-flight message."""
 
         with self._lifecycle_lock:
             if not self._started and not self._loop_started:
                 return
+
+            logger.info("Publisher stopping | pending=%s", self.store.size())
 
             # The commit lock establishes a clean boundary: after stop is
             # observed, an ACK cannot race into a durable removal.
@@ -309,7 +384,7 @@ class ReliablePublisher:
             self._connected.clear()
             self._ack_subscription_ready.clear()
 
-        logger.info("Reliable publisher stopped | pending=%s", self.store.size())
+        logger.info("Publisher stopped | pending=%s", self.store.size())
 
     def __enter__(self) -> ReliablePublisher:
         return self.start()
@@ -329,6 +404,8 @@ class ReliablePublisher:
             logger.warning("MQTT connection rejected | reason=%s", reason_code)
             return
 
+        self._connection_count += 1
+        reconnect = self._connection_count > 1
         self._connected.set()
         self._ack_subscription_ready.clear()
         with self._subscription_lock:
@@ -337,7 +414,10 @@ class ReliablePublisher:
         self._request_ack_subscription(client)
         self._wakeup.set()
         logger.info(
-            "MQTT connected | broker=%s:%s", self.config.host, self.config.port
+            "MQTT connection established | broker=%s:%s | reconnect=%s",
+            self.config.host,
+            self.config.port,
+            reconnect,
         )
 
     def _on_connect_fail(self, _client, _userdata, *_args) -> None:
@@ -352,12 +432,16 @@ class ReliablePublisher:
         log("MQTT disconnected | reason=%s", reason_code)
 
     def _on_subscribe(
-        self, _client, _userdata, message_id, reason_codes, _properties
+        self, _client, _userdata, mid, reason_codes, _properties
     ) -> None:
+        # `mid` is Paho's MQTT-protocol packet identifier for this SUBACK --
+        # unrelated to reliomq's own per-message `message_id` used elsewhere
+        # in this file and deliberately named differently to avoid confusing
+        # the two.
         with self._subscription_lock:
             expected_mid = self._subscription_mid
-            if expected_mid not in (-1, message_id):
-                logger.debug("Ignoring stale SUBACK | mid=%s", message_id)
+            if expected_mid not in (-1, mid):
+                logger.debug("Ignoring stale SUBACK | mid=%s", mid)
                 return
             self._subscription_mid = None
 
@@ -377,13 +461,13 @@ class ReliablePublisher:
             logger.debug(
                 "ACK subscription ready | topic=%s | mid=%s",
                 self.config.ack_topic,
-                message_id,
+                mid,
             )
         else:
             logger.warning(
                 "ACK subscription rejected | topic=%s | mid=%s",
                 self.config.ack_topic,
-                message_id,
+                mid,
             )
 
     def _on_message(self, _client, _userdata, message) -> None:
@@ -397,14 +481,14 @@ class ReliablePublisher:
             logger.warning("Ignoring malformed ACK: %s", error)
             return
 
-        if self._ack_tracker.match(acknowledgement.event_id):
+        if self._ack_tracker.match(acknowledgement.message_id):
             logger.debug(
-                "Matching ACK received | event_id=%s", acknowledgement.event_id
+                "Matching ACK received | message_id=%s", acknowledgement.message_id
             )
         else:
             logger.warning(
-                "Ignoring late or unmatched ACK | event_id=%s",
-                acknowledgement.event_id,
+                "Ignoring late or unmatched ACK | message_id=%s",
+                acknowledgement.message_id,
             )
 
     def _mark_disconnected(self) -> None:
@@ -442,7 +526,9 @@ class ReliablePublisher:
 
         mqtt_client = client or self.client
         try:
-            result, message_id = mqtt_client.subscribe(
+            # `mid` here is Paho's MQTT packet identifier for this SUBSCRIBE
+            # request, not a reliomq message_id.
+            result, mid = mqtt_client.subscribe(
                 self.config.ack_topic,
                 qos=self.config.qos,
             )
@@ -466,7 +552,7 @@ class ReliablePublisher:
                 return False
             # A synchronous callback may already have changed the sentinel.
             if self._subscription_mid == -1:
-                self._subscription_mid = message_id
+                self._subscription_mid = mid
         return self._ack_subscription_ready.is_set()
 
     def _connection_ready(self) -> bool:
@@ -502,36 +588,60 @@ class ReliablePublisher:
             self._request_ack_subscription()
             return DeliveryStatus.NOT_READY
 
-        self._ack_tracker.begin(envelope.event_id)
+        message_id = envelope.message_id
+        attempt = self._retry_attempts.get(message_id, 0) + 1
+        logger.debug(
+            "Delivery attempt starting | message_id=%s | topic=%s | attempt=%s",
+            message_id,
+            envelope.topic,
+            attempt,
+        )
+
+        self._ack_tracker.begin(message_id)
         try:
             if self._stop_event.is_set():
                 return DeliveryStatus.STOPPED
 
+            logger.debug(
+                "Publish attempt | message_id=%s | topic=%s",
+                message_id,
+                self.config.envelope_topic,
+            )
             published = confirmed_publish(
                 self.client,
-                self.config.data_topic,
+                self.config.envelope_topic,
                 envelope.to_bytes(),
                 qos=self.config.qos,
                 retain=False,
                 timeout=self.config.publish_timeout,
             )
             if not published:
-                logger.warning(
-                    "Reliable source publish not confirmed | event_id=%s",
-                    envelope.event_id,
+                return self._schedule_retry(
+                    message_id,
+                    reason="broker publish not confirmed",
                 )
-                return DeliveryStatus.RETRY
+
+            logger.debug("Broker publish confirmed (PUBACK) | message_id=%s", message_id)
+            logger.debug(
+                "Waiting for application acknowledgement | message_id=%s | timeout=%s",
+                message_id,
+                self.config.ack_timeout,
+            )
 
             if not self._ack_tracker.wait(self.config.ack_timeout):
-                logger.warning(
-                    "Application ACK timeout or interruption | event_id=%s",
-                    envelope.event_id,
+                if self._stop_event.is_set():
+                    logger.debug(
+                        "ACK wait interrupted by shutdown | message_id=%s", message_id
+                    )
+                    return DeliveryStatus.STOPPED
+                return self._schedule_retry(
+                    message_id,
+                    reason="application ACK timeout or interruption",
                 )
-                return (
-                    DeliveryStatus.STOPPED
-                    if self._stop_event.is_set()
-                    else DeliveryStatus.RETRY
-                )
+
+            logger.info(
+                "Application acknowledgement received | message_id=%s", message_id
+            )
 
             with self._commit_lock:
                 if self._stop_event.is_set():
@@ -540,25 +650,51 @@ class ReliablePublisher:
                     removed = self.store.remove_oldest(envelope)
                 except StoreError:
                     logger.exception(
-                        "ACK matched but durable removal failed | event_id=%s",
-                        envelope.event_id,
+                        "ACK matched but durable removal failed | message_id=%s",
+                        message_id,
                     )
                     return DeliveryStatus.STORE_ERROR
 
             if not removed:
                 logger.error(
                     "ACK matched but message was not the durable oldest | "
-                    "event_id=%s",
-                    envelope.event_id,
+                    "message_id=%s",
+                    message_id,
                 )
                 return DeliveryStatus.STORE_ERROR
 
+            self._retry_attempts.pop(message_id, None)
             with self._delivery_condition:
                 self._delivery_condition.notify_all()
-            logger.debug("Reliable delivery confirmed | event_id=%s", envelope.event_id)
+            logger.info(
+                "Message delivered and removed from durable queue | "
+                "message_id=%s | pending=%s",
+                message_id,
+                self.store.size(),
+            )
             return DeliveryStatus.DELIVERED
         finally:
             self._ack_tracker.end()
+
+    def _schedule_retry(self, message_id: str, *, reason: str) -> DeliveryStatus:
+        """Log why a delivery attempt failed and that it will be retried."""
+
+        attempt = self._retry_attempts.get(message_id, 0) + 1
+        self._retry_attempts[message_id] = attempt
+        logger.warning(
+            "Delivery attempt failed, will retry | message_id=%s | attempt=%s | "
+            "reason=%s",
+            message_id,
+            attempt,
+            reason,
+        )
+        logger.info(
+            "Retry scheduled | message_id=%s | attempt=%s | delay=%s",
+            message_id,
+            attempt,
+            self.config.retry_interval,
+        )
+        return DeliveryStatus.RETRY
 
     def _delivery_worker(self) -> None:
         while not self._stop_event.is_set():

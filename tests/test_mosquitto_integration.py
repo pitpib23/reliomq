@@ -22,7 +22,7 @@ import paho.mqtt.client as mqtt
 from reliomq import (
     BridgeConfig,
     DeliveryEnvelope,
-    ReliabilityConfig,
+    PublisherConfig,
     ReliableMqttBridge,
     ReliablePublisher,
 )
@@ -87,7 +87,7 @@ class MosquittoIntegrationTests(unittest.TestCase):
         subscription_ready = threading.Event()
         delivery_payloads: list[bytes] = []
         destination_topic = f"integration/output/{uuid.uuid4().hex}"
-        data_topic = f"integration/input/{uuid.uuid4().hex}"
+        envelope_topic = f"integration/input/{uuid.uuid4().hex}"
         ack_topic = f"integration/ack/{uuid.uuid4().hex}"
 
         consumer = mqtt.Client(
@@ -120,7 +120,7 @@ class MosquittoIntegrationTests(unittest.TestCase):
                 source_port=source_port,
                 destination_host="127.0.0.1",
                 destination_port=destination_port,
-                data_topic=data_topic,
+                envelope_topic=envelope_topic,
                 ack_topic=ack_topic,
             )
         )
@@ -129,11 +129,11 @@ class MosquittoIntegrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             publisher = ReliablePublisher(
-                ReliabilityConfig(
+                PublisherConfig(
                     host="127.0.0.1",
                     port=source_port,
                     queue_path=Path(directory) / "pending.jsonl",
-                    data_topic=data_topic,
+                    envelope_topic=envelope_topic,
                     ack_topic=ack_topic,
                     ack_timeout=5.0,
                     retry_interval=0.1,
@@ -142,15 +142,15 @@ class MosquittoIntegrationTests(unittest.TestCase):
             publisher.start()
             self.addCleanup(publisher.stop)
 
-            event_id = publisher.publish(
+            message_id = publisher.publish(
                 destination_topic,
                 {"temperature": 24.5},
             )
 
-            self.assertTrue(publisher.wait_for_delivery(event_id, timeout=10.0))
+            self.assertTrue(publisher.wait_for_delivery(message_id, timeout=10.0))
             self.assertTrue(received.wait(timeout=5.0))
             delivery = DeliveryEnvelope.from_bytes(delivery_payloads[0])
-            self.assertEqual(delivery.event_id, event_id)
+            self.assertEqual(delivery.message_id, message_id)
             self.assertEqual(delivery.payload, {"temperature": 24.5})
 
     @staticmethod

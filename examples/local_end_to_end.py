@@ -3,7 +3,10 @@
 Requires a real local Mosquitto broker (or any MQTT 3.1.1/5 broker) reachable
 at localhost:1883 -- this is NOT part of the automated test suite, which uses
 fake clients for determinism. Use this script to see actual PUBACKs, actual
-reconnect/backoff, and actual queue files on disk.
+reconnect/backoff, and actual queue files on disk. Both components have
+`log_level="INFO"` set, so you will also see reliomq's own narration of the
+whole lifecycle interleaved with the print()s below; set `debug=True`
+instead for the deeper DEBUG-level view (see debug_logging.py).
 
     mosquitto -p 1883 &
     python examples/local_end_to_end.py
@@ -20,7 +23,6 @@ zero once it is back, without losing or duplicating in this simple demo.
 
 from __future__ import annotations
 
-import logging
 import tempfile
 import time
 from pathlib import Path
@@ -29,19 +31,17 @@ import paho.mqtt.client as mqtt
 
 from reliomq import (
     BridgeConfig,
-    ReliabilityConfig,
+    PublisherConfig,
     ReliableMqttBridge,
     ReliablePublisher,
 )
 from reliomq.protocol import DeliveryEnvelope
 
 
-logging.basicConfig(level=logging.INFO)
-
 BROKER_HOST = "localhost"
 BROKER_PORT = 1883
 DESTINATION_TOPIC = "demo/machine1/data"
-DATA_TOPIC = "reliable/demo/ingress"
+ENVELOPE_TOPIC = "reliable/demo/ingress"
 ACK_TOPIC = "reliable/demo/acks"
 
 
@@ -76,39 +76,41 @@ def main() -> None:
             source_port=BROKER_PORT,
             destination_host=BROKER_HOST,
             destination_port=BROKER_PORT,
-            data_topic=DATA_TOPIC,
+            envelope_topic=ENVELOPE_TOPIC,
             ack_topic=ACK_TOPIC,
+            log_level="INFO",
         )
     )
     bridge.start()
 
     publisher = ReliablePublisher(
-        ReliabilityConfig(
+        PublisherConfig(
             host=BROKER_HOST,
             port=BROKER_PORT,
             queue_path=queue_path,
-            data_topic=DATA_TOPIC,
+            envelope_topic=ENVELOPE_TOPIC,
             ack_topic=ACK_TOPIC,
             ack_timeout=5.0,
             retry_interval=3.0,
+            log_level="INFO",
         )
     )
     publisher.start()
 
     try:
         for reading_number in range(1, 4):
-            event_id = publisher.publish(
+            message_id = publisher.publish(
                 topic=DESTINATION_TOPIC,
                 payload={"reading": reading_number, "value": reading_number * 1.5},
             )
-            print(f"published {event_id}, pending={publisher.pending_count()}")
+            print(f"published {message_id}, pending={publisher.pending_count()}")
 
         delivered = publisher.wait_for_delivery(timeout=15.0)
         print(f"all delivered: {delivered}, pending={publisher.pending_count()}")
         time.sleep(0.5)  # let the consumer's callback thread catch up
         print(f"consumer received {len(received)} message(s):")
         for envelope in received:
-            print(f"  event_id={envelope.event_id} payload={envelope.payload}")
+            print(f"  message_id={envelope.message_id} payload={envelope.payload}")
     finally:
         publisher.stop()
         bridge.stop()

@@ -1,4 +1,23 @@
-"""Wire protocol for reliable MQTT messages and acknowledgements."""
+"""Wire protocol for reliable MQTT messages and acknowledgements.
+
+Three envelope shapes travel over MQTT, all sharing one field that lets a
+single message be traced end-to-end: ``message_id``.
+
+- :class:`MessageEnvelope` -- what :class:`~reliomq.publisher.ReliablePublisher`
+  puts on the wire (on the *envelope topic*, see ``PublisherConfig``): the
+  application's ``topic``/``payload`` plus a stable ``message_id``.
+- :class:`DeliveryEnvelope` -- what :class:`~reliomq.bridge.ReliableMqttBridge`
+  publishes to the final *application* topic: just ``payload`` plus the same
+  ``message_id``, so a consumer can deduplicate.
+- :class:`Ack` -- what the bridge publishes back to the publisher's ack topic
+  once the destination delivery above is confirmed: only a ``message_id``.
+
+On the wire, the JSON field is still spelled ``event_id`` for every one of
+these -- that has not changed since 0.1.0, so a 0.1.x publisher and a 0.2.x
+bridge (or vice versa) remain fully interoperable across a rolling upgrade.
+Only the Python-facing name changed, because "event" reads as "something
+happened" when what this really is is a stable ID for *one message*.
+"""
 
 from __future__ import annotations
 
@@ -9,9 +28,17 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 
+from ._compat import (
+    deprecated_function_alias,
+    resolve_renamed_argument,
+    warn_deprecated_attribute,
+)
+
 
 PROTOCOL_VERSION = 1
-EVENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# Deprecated alias; the pattern itself never changed.
+EVENT_ID_PATTERN = MESSAGE_ID_PATTERN
 
 JsonScalar: TypeAlias = bool | int | float | str | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
@@ -22,16 +49,16 @@ class ProtocolError(ValueError):
     """Raised when a value is not valid for the reliability wire protocol."""
 
 
-def new_event_id() -> str:
+def new_message_id() -> str:
     """Return a compact UUID suitable for stable correlation across retries."""
 
     return uuid.uuid4().hex
 
 
-def validate_event_id(value: Any) -> str:
-    if not isinstance(value, str) or EVENT_ID_PATTERN.fullmatch(value) is None:
+def validate_message_id(value: Any) -> str:
+    if not isinstance(value, str) or MESSAGE_ID_PATTERN.fullmatch(value) is None:
         raise ProtocolError(
-            "event_id must contain 1-128 ASCII letters, digits, '_' or '-'"
+            "message_id must contain 1-128 ASCII letters, digits, '_' or '-'"
         )
     return value
 
@@ -204,20 +231,75 @@ def _require_schema(value: Any, expected_keys: frozenset[str], name: str) -> Non
         raise ProtocolError(f"invalid {name} schema ({', '.join(details)})")
 
 
-@dataclass(frozen=True, slots=True)
+def _resolve_message_id(
+    message_id: str | None, event_id: str | None, *, owner: str
+) -> str:
+    """Resolve message_id vs. the deprecated event_id keyword.
+
+    A fresh ID is only generated when neither was supplied.
+    """
+
+    if message_id is not None and event_id is None:
+        return message_id
+
+    resolved = resolve_renamed_argument(
+        new_value=message_id,
+        old_value=event_id,
+        new_name="message_id",
+        old_name="event_id",
+        owner=owner,
+        default="",
+        error_cls=ProtocolError,
+    )
+    return resolved or new_message_id()
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class MessageEnvelope:
-    """A durable source message, including its destination MQTT topic."""
+    """A durable source message, including its destination MQTT topic.
+
+    ``message_id`` is the stable identifier a caller can follow through logs
+    end-to-end: it is generated automatically unless supplied, and it never
+    changes across retries of the same message.
+    """
 
     topic: str
     payload: JsonValue
-    event_id: str = field(default_factory=new_event_id)
-    version: int = PROTOCOL_VERSION
+    message_id: str
+    version: int
+
+    def __init__(
+        self,
+        topic: str,
+        payload: JsonValue,
+        message_id: str | None = None,
+        version: int = PROTOCOL_VERSION,
+        *,
+        event_id: str | None = None,
+    ) -> None:
+        resolved_id = _resolve_message_id(
+            message_id, event_id, owner="MessageEnvelope"
+        )
+        object.__setattr__(self, "topic", topic)
+        object.__setattr__(self, "payload", payload)
+        object.__setattr__(self, "message_id", resolved_id)
+        object.__setattr__(self, "version", version)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         validate_publish_topic(self.topic)
-        validate_event_id(self.event_id)
+        validate_message_id(self.message_id)
         _validate_version(self.version)
         validate_json_value(self.payload)
+
+    @property
+    def event_id(self) -> str:
+        """Deprecated alias for :attr:`message_id`."""
+
+        warn_deprecated_attribute(
+            owner="MessageEnvelope", old_name="event_id", new_name="message_id"
+        )
+        return self.message_id
 
     def to_bytes(self) -> bytes:
         return encode_message(self)
@@ -227,18 +309,43 @@ class MessageEnvelope:
         return decode_message(data)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class DeliveryEnvelope:
     """Destination payload retaining the correlation ID for deduplication."""
 
-    event_id: str
+    message_id: str
     payload: JsonValue
-    version: int = PROTOCOL_VERSION
+    version: int
+
+    def __init__(
+        self,
+        message_id: str | None = None,
+        payload: JsonValue = None,
+        version: int = PROTOCOL_VERSION,
+        *,
+        event_id: str | None = None,
+    ) -> None:
+        resolved_id = _resolve_message_id(
+            message_id, event_id, owner="DeliveryEnvelope"
+        )
+        object.__setattr__(self, "message_id", resolved_id)
+        object.__setattr__(self, "payload", payload)
+        object.__setattr__(self, "version", version)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        validate_event_id(self.event_id)
+        validate_message_id(self.message_id)
         _validate_version(self.version)
         validate_json_value(self.payload)
+
+    @property
+    def event_id(self) -> str:
+        """Deprecated alias for :attr:`message_id`."""
+
+        warn_deprecated_attribute(
+            owner="DeliveryEnvelope", old_name="event_id", new_name="message_id"
+        )
+        return self.message_id
 
     def to_bytes(self) -> bytes:
         return encode_delivery(self)
@@ -248,16 +355,35 @@ class DeliveryEnvelope:
         return decode_delivery(data)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class Ack:
-    """A source acknowledgement correlated solely by a stable event ID."""
+    """A source acknowledgement correlated solely by a stable message ID."""
 
-    event_id: str
-    version: int = PROTOCOL_VERSION
+    message_id: str
+    version: int
+
+    def __init__(
+        self,
+        message_id: str | None = None,
+        version: int = PROTOCOL_VERSION,
+        *,
+        event_id: str | None = None,
+    ) -> None:
+        resolved_id = _resolve_message_id(message_id, event_id, owner="Ack")
+        object.__setattr__(self, "message_id", resolved_id)
+        object.__setattr__(self, "version", version)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        validate_event_id(self.event_id)
+        validate_message_id(self.message_id)
         _validate_version(self.version)
+
+    @property
+    def event_id(self) -> str:
+        """Deprecated alias for :attr:`message_id`."""
+
+        warn_deprecated_attribute(owner="Ack", old_name="event_id", new_name="message_id")
+        return self.message_id
 
     def to_bytes(self) -> bytes:
         return encode_ack(self)
@@ -273,7 +399,7 @@ def encode_message(envelope: MessageEnvelope) -> bytes:
     return _canonical_bytes(
         {
             "version": envelope.version,
-            "event_id": envelope.event_id,
+            "event_id": envelope.message_id,
             "topic": envelope.topic,
             "payload": envelope.payload,
         }
@@ -289,7 +415,7 @@ def decode_message(data: WireData) -> MessageEnvelope:
     )
     return MessageEnvelope(
         version=value["version"],
-        event_id=value["event_id"],
+        message_id=value["event_id"],
         topic=value["topic"],
         payload=value["payload"],
     )
@@ -301,7 +427,7 @@ def encode_delivery(envelope: DeliveryEnvelope) -> bytes:
     return _canonical_bytes(
         {
             "version": envelope.version,
-            "event_id": envelope.event_id,
+            "event_id": envelope.message_id,
             "payload": envelope.payload,
         }
     )
@@ -316,7 +442,7 @@ def decode_delivery(data: WireData) -> DeliveryEnvelope:
     )
     return DeliveryEnvelope(
         version=value["version"],
-        event_id=value["event_id"],
+        message_id=value["event_id"],
         payload=value["payload"],
     )
 
@@ -324,10 +450,30 @@ def decode_delivery(data: WireData) -> DeliveryEnvelope:
 def encode_ack(ack: Ack) -> bytes:
     if not isinstance(ack, Ack):
         raise ProtocolError("encode_ack requires an Ack")
-    return _canonical_bytes({"version": ack.version, "event_id": ack.event_id})
+    return _canonical_bytes({"version": ack.version, "event_id": ack.message_id})
 
 
 def decode_ack(data: WireData) -> Ack:
     value = _decode_json(data)
     _require_schema(value, frozenset(("version", "event_id")), "acknowledgement")
-    return Ack(version=value["version"], event_id=value["event_id"])
+    return Ack(version=value["version"], message_id=value["event_id"])
+
+
+# ---------------------------------------------------------------------------
+# Deprecated pre-0.2 names. These still work, but warn and will be removed in
+# a future release; prefer the message_id-based names above.
+# ---------------------------------------------------------------------------
+
+
+new_event_id = deprecated_function_alias(
+    new_message_id,
+    old_name="new_event_id",
+    new_name="new_message_id",
+    owner="reliomq.protocol",
+)
+validate_event_id = deprecated_function_alias(
+    validate_message_id,
+    old_name="validate_event_id",
+    new_name="validate_message_id",
+    owner="reliomq.protocol",
+)

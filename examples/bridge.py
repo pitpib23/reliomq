@@ -1,4 +1,10 @@
-"""Minimal source-to-destination reliable bridge service."""
+"""Minimal source-to-destination reliable bridge service.
+
+`log_level="INFO"` narrates both broker connections, each forwarded message,
+and each confirmed source ACK -- run this alongside a publisher (e.g.
+basic.py, pointed at the same envelope_topic/ack_topic) to watch a message
+cross from source to destination broker.
+"""
 
 import threading
 
@@ -10,8 +16,9 @@ config = BridgeConfig(
     source_port=1883,
     destination_host="mqtt.example.net",
     destination_port=1883,
-    data_topic="reliable/ingress",
+    envelope_topic="reliable/ingress",
     ack_topic="reliable/acks",
+    log_level="INFO",
 )
 
 bridge = ReliableMqttBridge(config)
@@ -22,4 +29,3 @@ except KeyboardInterrupt:
     pass
 finally:
     bridge.stop()
-

@@ -13,7 +13,7 @@ def bridge_config(**overrides):
     values = {
         "source_host": "source-broker",
         "destination_host": "destination-broker",
-        "data_topic": "reliable/input",
+        "envelope_topic": "reliable/input",
         "ack_topic": "reliable/ack",
         "destination_publish_timeout": 0.01,
         "source_ack_publish_timeout": 0.01,
@@ -59,7 +59,7 @@ class ReliableMqttBridgeTests(unittest.TestCase):
 
                 forwarded = bridge._forward_once(
                     MessageEnvelope(
-                        event_id="event-remote-failure",
+                        message_id="event-remote-failure",
                         topic="destination/data",
                         payload={"value": 1},
                     )
@@ -76,7 +76,7 @@ class ReliableMqttBridgeTests(unittest.TestCase):
         destination.publish_hook = lambda _call: call_order.append("destination")
         source.publish_hook = lambda _call: call_order.append("ack")
         envelope = MessageEnvelope(
-            event_id="event-success",
+            message_id="event-success",
             topic="factory/machine/data",
             payload={"temperature": 24.5},
         )
@@ -89,19 +89,21 @@ class ReliableMqttBridgeTests(unittest.TestCase):
         self.assertEqual(destination_call["qos"], 1)
         self.assertFalse(destination_call["retain"])
         delivered = DeliveryEnvelope.from_bytes(destination_call["payload"])
-        self.assertEqual(delivered.event_id, envelope.event_id)
+        self.assertEqual(delivered.message_id, envelope.message_id)
         self.assertEqual(delivered.payload, envelope.payload)
 
         ack_call = source.publish_calls[0]
         self.assertEqual(ack_call["topic"], bridge.config.ack_topic)
-        self.assertEqual(Ack.from_bytes(ack_call["payload"]).event_id, envelope.event_id)
+        self.assertEqual(
+            Ack.from_bytes(ack_call["payload"]).message_id, envelope.message_id
+        )
 
     def test_ack_publish_failure_reports_failure_after_remote_success(self) -> None:
         bridge, source, destination = self.make_bridge()
         self.make_ready(bridge, source, destination)
         source.publish_results.append(FakePublishInfo(rc=0, published=False))
         envelope = MessageEnvelope(
-            event_id="event-ack-failure", topic="destination/data", payload=1
+            message_id="event-ack-failure", topic="destination/data", payload=1
         )
 
         self.assertFalse(bridge._forward_once(envelope))
@@ -116,7 +118,7 @@ class ReliableMqttBridgeTests(unittest.TestCase):
         self.assertFalse(
             bridge._forward_once(
                 MessageEnvelope(
-                    event_id="event-offline",
+                    message_id="event-offline",
                     topic="destination/data",
                     payload=None,
                 )
@@ -132,7 +134,9 @@ class ReliableMqttBridgeTests(unittest.TestCase):
         source.emit_connect()
 
         self.assertFalse(bridge.source_subscription_ready)
-        self.assertEqual(source.subscribe_calls[0][:2], (bridge.config.data_topic, 1))
+        self.assertEqual(
+            source.subscribe_calls[0][:2], (bridge.config.envelope_topic, 1)
+        )
         source.emit_latest_suback((1,))
         self.assertTrue(bridge.source_subscription_ready)
 
@@ -145,7 +149,7 @@ class ReliableMqttBridgeTests(unittest.TestCase):
         bridge._source_subscription_ready.set()
 
         source.emit_message("wrong/topic", b"{}")
-        source.emit_message(bridge.config.data_topic, b"not-json")
+        source.emit_message(bridge.config.envelope_topic, b"not-json")
 
         self.assertEqual(bridge.queued_count, 0)
         self.assertEqual(source.publish_calls, [])
@@ -155,14 +159,14 @@ class ReliableMqttBridgeTests(unittest.TestCase):
         bridge._accepting.set()
         bridge._source_subscription_ready.set()
         first = MessageEnvelope(
-            event_id="event-one", topic="destination/data", payload=1
+            message_id="event-one", topic="destination/data", payload=1
         )
         second = MessageEnvelope(
-            event_id="event-two", topic="destination/data", payload=2
+            message_id="event-two", topic="destination/data", payload=2
         )
 
-        source.emit_message(bridge.config.data_topic, first.to_bytes())
-        source.emit_message(bridge.config.data_topic, second.to_bytes())
+        source.emit_message(bridge.config.envelope_topic, first.to_bytes())
+        source.emit_message(bridge.config.envelope_topic, second.to_bytes())
 
         self.assertEqual(bridge.queued_count, 1)
         self.assertEqual(bridge._tasks.get_nowait(), first)
@@ -174,7 +178,7 @@ class ReliableMqttBridgeTests(unittest.TestCase):
         bridge, source, destination = self.make_bridge()
         self.make_ready(bridge, source, destination)
         envelope = MessageEnvelope(
-            event_id="duplicate-event",
+            message_id="duplicate-event",
             topic="destination/data",
             payload={"value": 7},
         )
@@ -184,13 +188,24 @@ class ReliableMqttBridgeTests(unittest.TestCase):
 
         self.assertEqual(len(destination.publish_calls), 2)
         destination_ids = [
-            DeliveryEnvelope.from_bytes(call["payload"]).event_id
+            DeliveryEnvelope.from_bytes(call["payload"]).message_id
             for call in destination.publish_calls
         ]
-        self.assertEqual(destination_ids, [envelope.event_id, envelope.event_id])
+        self.assertEqual(destination_ids, [envelope.message_id, envelope.message_id])
         self.assertEqual(len(source.publish_calls), 2)
+
+
+class ReliableMqttBridgeDeprecatedCompatTests(unittest.TestCase):
+    def test_data_topic_keyword_still_works_and_warns(self) -> None:
+        # bridge_config() always sets envelope_topic, so exercise the
+        # deprecated alias through a bare BridgeConfig() call instead.
+        with self.assertWarns(DeprecationWarning):
+            config = BridgeConfig(
+                source_host="s", destination_host="d", data_topic="legacy/topic"
+            )
+
+        self.assertEqual(config.envelope_topic, "legacy/topic")
 
 
 if __name__ == "__main__":
     unittest.main()
-

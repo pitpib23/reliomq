@@ -3,26 +3,27 @@ from __future__ import annotations
 import tempfile
 import threading
 import unittest
+import warnings
 from pathlib import Path
 
 from fakes import FakeClient, FakePublishInfo, client_factory_for
-from reliomq.config import ReliabilityConfig
+from reliomq.config import PublisherConfig
 from reliomq.protocol import Ack, MessageEnvelope
 from reliomq.publisher import DeliveryStatus, ReliablePublisher
 
 
-def publisher_config(queue_path: Path, **overrides) -> ReliabilityConfig:
+def publisher_config(queue_path: Path, **overrides) -> PublisherConfig:
     values = {
         "host": "source-broker",
         "queue_path": queue_path,
-        "data_topic": "reliable/input",
+        "envelope_topic": "reliable/input",
         "ack_topic": "reliable/ack",
         "ack_timeout": 0.002,
         "publish_timeout": 0.01,
         "retry_interval": 0.01,
     }
     values.update(overrides)
-    return ReliabilityConfig(**values)
+    return PublisherConfig(**values)
 
 
 class ReliablePublisherTests(unittest.TestCase):
@@ -52,7 +53,7 @@ class ReliablePublisherTests(unittest.TestCase):
             envelope = MessageEnvelope.from_bytes(call["payload"])
             client.emit_message(
                 publisher.config.ack_topic,
-                Ack(event_id=envelope.event_id).to_bytes(),
+                Ack(message_id=envelope.message_id).to_bytes(),
             )
 
         client.publish_hook = hook
@@ -61,34 +62,34 @@ class ReliablePublisherTests(unittest.TestCase):
         publisher, client = self.make_publisher()
         self.make_ready(publisher, client)
         self.ack_each_publish(publisher, client)
-        event_id = publisher.publish(
-            "factory/machine/data", {"temperature": 24.5}, event_id="event-ok"
+        message_id = publisher.publish(
+            "factory/machine/data", {"temperature": 24.5}, message_id="event-ok"
         )
 
         status = publisher._process_oldest_once()
 
         self.assertEqual(status, DeliveryStatus.DELIVERED)
-        self.assertEqual(event_id, "event-ok")
+        self.assertEqual(message_id, "event-ok")
         self.assertEqual(publisher.pending_count(), 0)
-        self.assertTrue(publisher.wait_for_delivery(event_id, timeout=0))
+        self.assertTrue(publisher.wait_for_delivery(message_id, timeout=0))
         call = client.publish_calls[0]
-        self.assertEqual(call["topic"], publisher.config.data_topic)
+        self.assertEqual(call["topic"], publisher.config.envelope_topic)
         self.assertEqual(call["qos"], 1)
         self.assertFalse(call["retain"])
 
     def test_publish_while_broker_unavailable_is_durable_and_not_attempted(self) -> None:
         publisher, client = self.make_publisher()
-        event_id = publisher.publish("factory/data", {"value": 1})
+        message_id = publisher.publish("factory/data", {"value": 1})
 
         self.assertEqual(publisher._process_oldest_once(), DeliveryStatus.NOT_READY)
-        self.assertTrue(publisher.store.contains(event_id))
+        self.assertTrue(publisher.store.contains(message_id))
         self.assertEqual(client.publish_calls, [])
 
     def test_ack_timeout_retains_message_and_restart_loads_same_id(self) -> None:
         publisher, client = self.make_publisher()
         self.make_ready(publisher, client)
-        event_id = publisher.publish(
-            "factory/data", {"value": 1}, event_id="stable-timeout-id"
+        message_id = publisher.publish(
+            "factory/data", {"value": 1}, message_id="stable-timeout-id"
         )
 
         self.assertEqual(publisher._process_oldest_once(), DeliveryStatus.RETRY)
@@ -102,7 +103,7 @@ class ReliablePublisherTests(unittest.TestCase):
         self.addCleanup(restarted.stop)
         oldest = restarted.store.peek_oldest()
         self.assertIsNotNone(oldest)
-        self.assertEqual(oldest.event_id, event_id)
+        self.assertEqual(oldest.message_id, message_id)
 
     def test_publish_return_error_and_confirmation_timeout_retain_message(self) -> None:
         for info in (
@@ -130,17 +131,17 @@ class ReliablePublisherTests(unittest.TestCase):
 
     def test_fifo_recovery_uses_oldest_before_new_messages(self) -> None:
         publisher, client = self.make_publisher()
-        first = publisher.publish("factory/data", 1, event_id="fifo-1")
-        second = publisher.publish("factory/data", 2, event_id="fifo-2")
+        first = publisher.publish("factory/data", 1, message_id="fifo-1")
+        second = publisher.publish("factory/data", 2, message_id="fifo-2")
         self.make_ready(publisher, client)
-        third = publisher.publish("factory/data", 3, event_id="fifo-3")
+        third = publisher.publish("factory/data", 3, message_id="fifo-3")
         observed: list[str] = []
 
         def hook(call) -> None:
             envelope = MessageEnvelope.from_bytes(call["payload"])
-            observed.append(envelope.event_id)
+            observed.append(envelope.message_id)
             client.emit_message(
-                publisher.config.ack_topic, Ack(envelope.event_id).to_bytes()
+                publisher.config.ack_topic, Ack(envelope.message_id).to_bytes()
             )
 
         client.publish_hook = hook
@@ -153,17 +154,17 @@ class ReliablePublisherTests(unittest.TestCase):
 
     def test_matching_ack_removes_exactly_one_message(self) -> None:
         publisher, client = self.make_publisher()
-        publisher.publish("factory/data", 1, event_id="head")
-        publisher.publish("factory/data", 2, event_id="tail")
+        publisher.publish("factory/data", 1, message_id="head")
+        publisher.publish("factory/data", 2, message_id="tail")
         self.make_ready(publisher, client)
         self.ack_each_publish(publisher, client)
 
         self.assertEqual(publisher._process_oldest_once(), DeliveryStatus.DELIVERED)
 
         self.assertEqual(publisher.pending_count(), 1)
-        self.assertEqual(publisher.store.peek_oldest().event_id, "tail")
+        self.assertEqual(publisher.store.peek_oldest().message_id, "tail")
 
-    def test_wrong_event_id_and_malformed_ack_do_not_remove_message(self) -> None:
+    def test_wrong_message_id_and_malformed_ack_do_not_remove_message(self) -> None:
         malformed_values = (
             Ack("other-event").to_bytes(),
             b"not-json",
@@ -179,7 +180,7 @@ class ReliablePublisherTests(unittest.TestCase):
                 )
                 self.addCleanup(publisher.stop)
                 self.make_ready(publisher, client)
-                publisher.publish("factory/data", 1, event_id=f"expected-{index}")
+                publisher.publish("factory/data", 1, message_id=f"expected-{index}")
                 client.publish_hook = lambda _call, value=ack_payload: client.emit_message(
                     publisher.config.ack_topic, value
                 )
@@ -192,8 +193,8 @@ class ReliablePublisherTests(unittest.TestCase):
     def test_late_ack_is_ignored_while_next_message_waits(self) -> None:
         publisher, client = self.make_publisher()
         self.make_ready(publisher, client)
-        publisher.publish("factory/data", 1, event_id="old-event")
-        publisher.publish("factory/data", 2, event_id="new-event")
+        publisher.publish("factory/data", 1, message_id="old-event")
+        publisher.publish("factory/data", 2, message_id="new-event")
 
         self.assertEqual(publisher._process_oldest_once(), DeliveryStatus.RETRY)
         client.emit_message(publisher.config.ack_topic, Ack("old-event").to_bytes())
@@ -205,11 +206,11 @@ class ReliablePublisherTests(unittest.TestCase):
         )
 
         self.assertEqual(publisher._process_oldest_once(), DeliveryStatus.RETRY)
-        self.assertEqual(publisher.store.peek_oldest().event_id, "new-event")
+        self.assertEqual(publisher.store.peek_oldest().message_id, "new-event")
 
     def test_disconnect_then_connect_and_suback_resume_recovery(self) -> None:
         publisher, client = self.make_publisher()
-        publisher.publish("factory/data", 1, event_id="recover-after-connect")
+        publisher.publish("factory/data", 1, message_id="recover-after-connect")
 
         client.emit_connect()
         self.assertFalse(publisher._connection_ready())
@@ -223,34 +224,36 @@ class ReliablePublisherTests(unittest.TestCase):
         client.emit_disconnect()
         self.assertFalse(publisher._connection_ready())
 
-    def test_retry_keeps_the_same_event_id(self) -> None:
+    def test_retry_keeps_the_same_message_id(self) -> None:
         publisher, client = self.make_publisher()
         self.make_ready(publisher, client)
-        event_id = publisher.publish("factory/data", 1)
+        message_id = publisher.publish("factory/data", 1)
         observed: list[str] = []
 
         def record_only(call) -> None:
-            observed.append(MessageEnvelope.from_bytes(call["payload"]).event_id)
+            observed.append(MessageEnvelope.from_bytes(call["payload"]).message_id)
 
         client.publish_hook = record_only
         self.assertEqual(publisher._process_oldest_once(), DeliveryStatus.RETRY)
         self.ack_each_publish(publisher, client)
         client.publish_hook = lambda call: (
-            observed.append(MessageEnvelope.from_bytes(call["payload"]).event_id),
+            observed.append(MessageEnvelope.from_bytes(call["payload"]).message_id),
             client.emit_message(
                 publisher.config.ack_topic,
-                Ack(MessageEnvelope.from_bytes(call["payload"]).event_id).to_bytes(),
+                Ack(
+                    MessageEnvelope.from_bytes(call["payload"]).message_id
+                ).to_bytes(),
             ),
         )
 
         self.assertEqual(publisher._process_oldest_once(), DeliveryStatus.DELIVERED)
-        self.assertEqual(observed, [event_id, event_id])
+        self.assertEqual(observed, [message_id, message_id])
 
     def test_duplicate_ack_cannot_remove_the_next_message(self) -> None:
         publisher, client = self.make_publisher()
         self.make_ready(publisher, client)
-        publisher.publish("factory/data", 1, event_id="duplicate-ack")
-        publisher.publish("factory/data", 2, event_id="untouched-tail")
+        publisher.publish("factory/data", 1, message_id="duplicate-ack")
+        publisher.publish("factory/data", 2, message_id="untouched-tail")
 
         def duplicate_ack(_call) -> None:
             payload = Ack("duplicate-ack").to_bytes()
@@ -264,11 +267,11 @@ class ReliablePublisherTests(unittest.TestCase):
         )
 
         self.assertEqual(publisher.pending_count(), 1)
-        self.assertEqual(publisher.store.peek_oldest().event_id, "untouched-tail")
+        self.assertEqual(publisher.store.peek_oldest().message_id, "untouched-tail")
 
     def test_shutdown_interrupts_ack_wait_and_leaves_inflight_durable(self) -> None:
         publisher, client = self.make_publisher(ack_timeout=30.0)
-        event_id = publisher.publish("factory/data", 1, event_id="shutdown-event")
+        message_id = publisher.publish("factory/data", 1, message_id="shutdown-event")
         publish_called = threading.Event()
         client.publish_hook = lambda _call: publish_called.set()
         publisher.start()
@@ -278,10 +281,70 @@ class ReliablePublisherTests(unittest.TestCase):
         self.assertTrue(publish_called.wait(timeout=1.0))
         publisher.stop()
 
-        self.assertTrue(publisher.store.contains(event_id))
+        self.assertTrue(publisher.store.contains(message_id))
         self.assertEqual(publisher.pending_count(), 1)
+
+    def test_retry_attempt_counter_increments_and_resets_on_delivery(self) -> None:
+        # In-memory-only diagnostic counter surfaced in retry logs; never
+        # persisted and never affects delivery decisions.
+        publisher, client = self.make_publisher()
+        message_id = publisher.publish("factory/data", 1, message_id="counted")
+
+        self.assertEqual(publisher._process_oldest_once(), DeliveryStatus.NOT_READY)
+        self.assertNotIn(message_id, publisher._retry_attempts)
+
+        self.make_ready(publisher, client)
+        client.publish_results.append(FakePublishInfo(rc=4, published=False))
+        self.assertEqual(publisher._process_oldest_once(), DeliveryStatus.RETRY)
+        self.assertEqual(publisher._retry_attempts[message_id], 1)
+
+        client.publish_results.append(FakePublishInfo(rc=4, published=False))
+        self.assertEqual(publisher._process_oldest_once(), DeliveryStatus.RETRY)
+        self.assertEqual(publisher._retry_attempts[message_id], 2)
+
+        self.ack_each_publish(publisher, client)
+        self.assertEqual(publisher._process_oldest_once(), DeliveryStatus.DELIVERED)
+        self.assertNotIn(message_id, publisher._retry_attempts)
+
+
+class ReliablePublisherDeprecatedCompatTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.queue_path = Path(self.temporary_directory.name) / "pending.jsonl"
+        client = FakeClient()
+        self.client = client
+        self.publisher = ReliablePublisher(
+            publisher_config(self.queue_path),
+            client_factory=client_factory_for(client),
+        )
+        self.addCleanup(self.publisher.stop)
+
+    def test_publish_event_id_keyword_still_works_and_warns(self) -> None:
+        with self.assertWarns(DeprecationWarning):
+            message_id = self.publisher.publish(
+                "factory/data", 1, event_id="legacy-publish-id"
+            )
+
+        self.assertEqual(message_id, "legacy-publish-id")
+
+    def test_wait_for_delivery_event_id_keyword_still_works_and_warns(self) -> None:
+        self.publisher.publish("factory/data", 1, message_id="legacy-wait-id")
+
+        with self.assertWarns(DeprecationWarning):
+            delivered = self.publisher.wait_for_delivery(
+                event_id="legacy-wait-id", timeout=0
+            )
+
+        self.assertFalse(delivered)  # still pending; broker was never readied
+
+    def test_conflicting_message_id_and_event_id_on_publish_raise(self) -> None:
+        with self.assertRaises(ValueError), warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            self.publisher.publish(
+                "factory/data", 1, message_id="a", event_id="b"
+            )
 
 
 if __name__ == "__main__":
     unittest.main()
-
