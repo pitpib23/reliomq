@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,10 +8,29 @@ version = "0.1.0"
 description = "Durable, application-acknowledged MQTT publishing and forwarding"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["mqtt", "paho-mqtt", "reliability", "durable", "iot", "delivery", "acknowledgement"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications",
+    "Topic :: System :: Networking",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "paho-mqtt>=2.0,<3.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/pitpib23/reliomq"
+Repository = "https://github.com/pitpib23/reliomq"
+Issues = "https://github.com/pitpib23/reliomq/issues"
 
 [tool.setuptools]
 packages = ["reliomq"]
