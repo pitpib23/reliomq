@@ -28,10 +28,12 @@ Requires **Python 3.11+** and **Paho MQTT 2.x**.
 
 > **Upgrading from an earlier release?** Nothing breaks. `ReliablePublisher`/
 > `PublisherConfig`/`ReliableMqttBridge`/`BridgeConfig`/`DurableMessageStore`/
-> `Ack`, `queue_path=`, `envelope_topic=`/`data_topic=`, `ack_topic=`, and
-> `event_id=` all still work — they now emit a `DeprecationWarning` pointing
-> at their replacement. See [Migrating to 0.3.0](#migrating-to-030) below
-> and [CHANGELOG.md](CHANGELOG.md) for the full picture.
+> `Ack`, `queue_path=`, `envelope_topic=`/`data_topic=`, `ack_topic=`,
+> `ack_timeout=`/`publish_timeout=`, and `event_id=` all still work — they
+> now emit a `DeprecationWarning` pointing at their replacement. See
+> [Migrating to 0.4.0](#migrating-to-040) and
+> [Migrating to 0.3.0](#migrating-to-030) below, and
+> [CHANGELOG.md](CHANGELOG.md), for the full picture.
 
 ## I want to...
 
@@ -1209,6 +1211,22 @@ examples/<name>.py`) against a real broker unless noted otherwise:
 - `tls_auth_client.py` — injecting TLS and username/password auth through a
   custom `client_factory` without adding security config to the library.
 
+## Migrating to 0.4.0
+
+0.4.0 is a pure naming/documentation release on top of 0.3.0 -- no classes,
+modules, or lifecycle methods changed. It renames the two internal,
+background-worker timeouts on `SenderConfig` so the layer is obvious from
+the name alone; see [Timeouts, ACKs, and Blocking Behavior](#timeouts-acks-and-blocking-behavior)
+for why.
+
+| Old | New | Notes |
+|---|---|---|
+| `ack_timeout=` | `delivery_ack_timeout=` | The name now says which ACK -- reliomq's own, not MQTT's PUBACK. |
+| `publish_timeout=` | `mqtt_puback_timeout=` | The name now says which layer -- MQTT, not reliomq's end-to-end delivery. |
+
+Both old names still work, unchanged, with a `DeprecationWarning`. See
+[CHANGELOG.md](CHANGELOG.md) for the complete 0.4.0 release notes.
+
 ## Migrating to 0.3.0
 
 0.3.0 is backward compatible: every earlier name below still works today
@@ -1227,8 +1245,6 @@ deployed breaks.
 | `queue_path=` | `outbox_path=` | |
 | `data_topic=` (0.1.x) / `envelope_topic=` (0.2.x) | `relay_topic=` | Two generations of alias, both still accepted. |
 | `ack_topic=` | `delivery_ack_topic=` | |
-| `ack_timeout=` | `delivery_ack_timeout=` | The name now says which ACK -- see [Timeouts, ACKs, and Blocking Behavior](#timeouts-acks-and-blocking-behavior). |
-| `publish_timeout=` | `mqtt_puback_timeout=` | The name now says which layer -- MQTT, not reliomq. |
 | `sender.store` (was `publisher.store`) | `sender.outbox` | |
 | `reliomq.publisher` / `reliomq.bridge` / `reliomq.store` (module paths) | `reliomq.sender` / `reliomq.relay` / `reliomq.outbox` | Old import paths still work via thin re-export modules. |
 | `Relay(..., bridge_logger=...)` | `Relay(..., relay_logger=...)` | |
