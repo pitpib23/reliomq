@@ -2,6 +2,93 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.4.0 — 2026-09-02
+
+A timeout-naming and execution-model documentation follow-up to 0.3.0. No
+class/module/topic renames, no lifecycle changes -- this release is purely
+about naming the two internal, background timeouts after exactly what each
+one waits for, and making the blocking-vs-background execution model
+explicit enough to answer "which ACK is this?" and "does this block my
+code?" without reading the source. Reliability semantics, the wire
+protocol, and the on-disk Outbox format are all unchanged from 0.1.0.
+
+### Timeout naming
+
+- **`SenderConfig.publish_timeout` → `mqtt_puback_timeout`**,
+  **`SenderConfig.ack_timeout` → `delivery_ack_timeout`**. In a two-layer
+  acknowledgement protocol, "ack_timeout" doesn't say which ACK, and
+  "publish_timeout" doesn't say which publish (the source MQTT publish, or
+  the whole delivery?). The new names put the layer directly in the name:
+  `mqtt_puback_timeout` governs only the MQTT/Paho QoS 1 PUBACK wait for
+  one publish attempt; `delivery_ack_timeout` governs only the wait for
+  reliomq's own end-to-end `DeliveryAck`. Both remain internal,
+  background-worker timeouts that never block the calling thread --
+  `Sender.wait_for_delivery(timeout=...)` is unchanged and remains the only
+  one of the three waits that belongs to the caller. `RelayConfig`'s
+  already-unambiguous `destination_publish_timeout` /
+  `source_ack_publish_timeout` were not touched.
+
+### Documentation
+
+- New README sections addressing the timeout/blocking execution model:
+  "I want to..." (a quick decision table near the top), "Timeouts, ACKs,
+  and Blocking Behavior" (the three-wait table plus a two-thread diagram
+  distinguishing the calling thread from reliomq's background delivery
+  worker), "What to Use and When" (a background-vs-blocking decision table
+  for every public tool, plus a compact what-it-does/use-when/don't-use-
+  when/background/blocks-caller/example writeup for `Sender`,
+  `wait_for_delivery()`, `pending_count()`, `mqtt_puback_timeout`,
+  `delivery_ack_timeout`, and `retry_interval`), and a "Timeout and retry
+  settings in detail" table (layer, where it runs, whether it blocks the
+  caller, and recommended usage for every timeout/retry setting on both
+  configs).
+- README's "Cookbook" section (0.3.0) renamed and expanded to "Common
+  Usage Patterns": fire-and-continue telemetry, publish-and-confirm,
+  operational monitoring, debugging a stuck message, temporary network
+  outage, graceful shutdown, and when `Relay` is required -- each pattern
+  now states plainly whether it blocks the caller.
+
+### Logging terminology
+
+- Retry-reason strings now name the specific layer that failed to confirm
+  rather than a generic phrase: `"MQTT PUBACK not confirmed within
+  mqtt_puback_timeout"` and `"DeliveryAck not confirmed within
+  delivery_ack_timeout"` replace the previous `"broker publish not
+  confirmed"` / `"DeliveryAck timeout or interruption"`. Pure log-text
+  changes; the retry decision and timing behind them are unchanged.
+- DEBUG-level `Publish attempt` and `Waiting for DeliveryAck` lines now
+  include the exact configured `mqtt_puback_timeout=`/
+  `delivery_ack_timeout=` value in effect, so a value can be read directly
+  off the log line that's blocked on it.
+- `"Broker publish confirmed (PUBACK)"` → `"MQTT PUBACK received"`;
+  `"ACK subscription ready/rejected"` and `"ACK subscription request
+  failed/rejected"` → `"DeliveryAck subscription ..."` (this is
+  specifically the subscription to the delivery-ack topic, not a PUBACK);
+  `"Retry scheduled"` → `"Delivery retry scheduled"`;
+  Outbox's `"Persisted message removed"` → `"Message removed from
+  Outbox"`. None of these renames change what triggers the log line or
+  what happens afterward.
+
+### Compatibility
+
+- `ack_timeout=`, `publish_timeout=` -- still accepted as `SenderConfig`
+  constructor keywords (each resolving to the new field, each warning) and
+  as read-back properties. All 0.3.0 and earlier deprecated aliases
+  (`ReliablePublisher`, `PublisherConfig`, `ReliabilityConfig`,
+  `ReliableMqttBridge`, `BridgeConfig`, `DurableMessageStore`, `StoreError`,
+  `Ack`, `queue_path=`, `data_topic=`/`envelope_topic=`, `ack_topic=`,
+  `sender.store`, `Relay(bridge_logger=...)`, and the old
+  `reliomq.publisher`/`.bridge`/`.store` module paths) are unchanged and
+  still work.
+- No intentional breaking changes.
+
+### Migration
+
+`mqtt_puback_timeout=`/`delivery_ack_timeout=` replace
+`publish_timeout=`/`ack_timeout=` on `SenderConfig` -- update at your own
+pace, since the old names keep working (with a `DeprecationWarning`).
+Nothing else changed.
+
 ## 0.3.0 — 2026-09-01
 
 A naming, usability, and documentation follow-up to 0.2.0: reliomq's public
@@ -27,19 +114,6 @@ all unchanged from 0.1.0/0.2.0.
   (0.1.0 `data_topic` → 0.2.0 `envelope_topic` → 0.3.0 `relay_topic`); all
   three spellings are still accepted as constructor keywords and read-back
   properties.
-- **`SenderConfig.publish_timeout` → `mqtt_puback_timeout`**,
-  **`SenderConfig.ack_timeout` → `delivery_ack_timeout`**. In a two-layer
-  acknowledgement protocol, "ack_timeout" doesn't say which ACK, and
-  "publish_timeout" doesn't say which publish (the source MQTT publish, or
-  the whole delivery?). The new names put the layer directly in the name:
-  `mqtt_puback_timeout` governs only the MQTT/Paho QoS 1 PUBACK wait for
-  one publish attempt; `delivery_ack_timeout` governs only the wait for
-  reliomq's own end-to-end `DeliveryAck`. Both remain internal,
-  background-worker timeouts that never block the calling thread --
-  `Sender.wait_for_delivery(timeout=...)` is unchanged and remains the only
-  one of the three waits that belongs to the caller. `RelayConfig`'s
-  already-unambiguous `destination_publish_timeout` /
-  `source_ack_publish_timeout` were not touched.
 - Canonical module layout: `reliomq/sender.py`, `reliomq/relay.py`,
   `reliomq/outbox.py`. The old `reliomq/publisher.py`,
   `reliomq/bridge.py`, `reliomq/store.py` module paths still work as thin
@@ -78,23 +152,9 @@ all unchanged from 0.1.0/0.2.0.
   know Paho MQTT" (mapping table + the two important differences),
   "Publishing" (all seven canonical publish patterns: basic, capture ID,
   publish-and-continue, publish-and-wait, offline publish, restart
-  recovery, pending-count monitoring), "Relay integration", "Common Usage
-  Patterns" (fire-and-continue, publish-and-confirm, monitoring, debugging
-  a stuck message, outage/recovery, graceful shutdown, when `Relay` is
-  required), and a full "Public API" reference covering every public
-  class, method, property, and exception with a minimal example each.
-- New README sections addressing the timeout/blocking execution model
-  specifically: "I want to..." (a quick decision table near the top),
-  "Timeouts, ACKs, and Blocking Behavior" (the three-wait table plus a
-  two-thread diagram distinguishing the calling thread from reliomq's
-  background delivery worker), "What to Use and When" (a background-vs-
-  blocking decision table for every public tool, plus a compact
-  what-it-does/use-when/don't-use-when/background/blocks-caller/example
-  writeup for `Sender`, `wait_for_delivery()`, `pending_count()`,
-  `mqtt_puback_timeout`, `delivery_ack_timeout`, and `retry_interval`), and
-  a "Timeout and retry settings in detail" table (layer, where it runs,
-  whether it blocks the caller, and recommended usage for every
-  timeout/retry setting on both configs).
+  recovery, pending-count monitoring), "Relay integration", "Cookbook",
+  and a full "Public API" reference covering every public class, method,
+  property, and exception with a minimal example each.
 - New examples: `paho_style_lifecycle.py` (explicit lifecycle shown
   equivalent to the context-manager form) and `modbus_sensor.py` (a
   realistic, read-only Modbus TCP poller bridged to MQTT through `Sender`;
@@ -103,37 +163,15 @@ all unchanged from 0.1.0/0.2.0.
 - All examples and their docstrings updated to the new preferred names and
   lifecycle calls.
 
-### Logging terminology
-
-- Retry-reason strings now name the specific layer that failed to confirm
-  rather than a generic phrase: `"MQTT PUBACK not confirmed within
-  mqtt_puback_timeout"` and `"DeliveryAck not confirmed within
-  delivery_ack_timeout"` replace the previous `"broker publish not
-  confirmed"` / `"DeliveryAck timeout or interruption"`. Pure log-text
-  changes; the retry decision and timing behind them are unchanged.
-- DEBUG-level `Publish attempt` and `Waiting for DeliveryAck` lines now
-  include the exact configured `mqtt_puback_timeout=`/
-  `delivery_ack_timeout=` value in effect, so a value can be read directly
-  off the log line that's blocked on it.
-- `"Broker publish confirmed (PUBACK)"` → `"MQTT PUBACK received"`;
-  `"ACK subscription ready/rejected"` and `"ACK subscription request
-  failed/rejected"` → `"DeliveryAck subscription ..."` (this is
-  specifically the subscription to the delivery-ack topic, not a PUBACK);
-  `"Retry scheduled"` → `"Delivery retry scheduled"`;
-  Outbox's `"Persisted message removed"` → `"Message removed from
-  Outbox"`. None of these renames change what triggers the log line or
-  what happens afterward.
-
 ### Compatibility
 
 - `ReliablePublisher`, `PublisherConfig`, `ReliabilityConfig`,
   `ReliableMqttBridge`, `BridgeConfig`, `DurableMessageStore`, `StoreError`,
   `Ack` — all kept as working aliases of their new names, each emitting
   `DeprecationWarning`.
-- `queue_path=`, `data_topic=`/`envelope_topic=`, `ack_topic=`,
-  `ack_timeout=`, `publish_timeout=` — all still accepted as constructor
-  keywords (each resolving to the new field, each warning) and as
-  read-back properties.
+- `queue_path=`, `data_topic=`/`envelope_topic=`, `ack_topic=` — all still
+  accepted as constructor keywords (each resolving to the new field, each
+  warning) and as read-back properties.
 - `sender.store` (property, warns) still reads `sender.outbox`.
 - `Relay(..., bridge_logger=...)` still works as an alias for
   `relay_logger=` (warns).
