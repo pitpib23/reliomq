@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 import unittest
 import warnings
 from pathlib import Path
@@ -18,8 +19,8 @@ def sender_config(outbox_path: Path, **overrides) -> SenderConfig:
         "outbox_path": outbox_path,
         "relay_topic": "reliable/input",
         "delivery_ack_topic": "reliable/ack",
-        "ack_timeout": 0.002,
-        "publish_timeout": 0.01,
+        "delivery_ack_timeout": 0.002,
+        "mqtt_puback_timeout": 0.01,
         "retry_interval": 0.01,
     }
     values.update(overrides)
@@ -85,7 +86,7 @@ class SenderTests(unittest.TestCase):
         self.assertTrue(sender.outbox.contains(message_id))
         self.assertEqual(client.publish_calls, [])
 
-    def test_ack_timeout_retains_message_and_restart_loads_same_id(self) -> None:
+    def test_delivery_ack_timeout_retains_message_and_restart_loads_same_id(self) -> None:
         sender, client = self.make_sender()
         self.make_ready(sender, client)
         message_id = sender.publish(
@@ -273,7 +274,7 @@ class SenderTests(unittest.TestCase):
         self.assertEqual(sender.outbox.peek_oldest().message_id, "untouched-tail")
 
     def test_shutdown_interrupts_ack_wait_and_leaves_inflight_durable(self) -> None:
-        sender, client = self.make_sender(ack_timeout=30.0)
+        sender, client = self.make_sender(delivery_ack_timeout=30.0)
         message_id = sender.publish("factory/data", 1, message_id="shutdown-event")
         publish_called = threading.Event()
         client.publish_hook = lambda _call: publish_called.set()
@@ -390,6 +391,82 @@ class SenderOutboxAttributeTests(unittest.TestCase):
     def test_store_property_reads_outbox_and_warns(self) -> None:
         with self.assertWarns(DeprecationWarning):
             self.assertIs(self.sender.store, self.sender.outbox)
+
+
+class SenderTimeoutWiringTests(unittest.TestCase):
+    """Regression coverage for the mqtt_puback_timeout/delivery_ack_timeout
+    rename: prove each config value actually governs the layer its name
+    promises, not just that the field exists under a new name."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.outbox_path = Path(self.temporary_directory.name) / "pending.jsonl"
+
+    def make_ready(self, sender: Sender, client: FakeClient) -> None:
+        client.connected = True
+        sender._connected.set()
+        sender._ack_subscription_ready.set()
+
+    def test_mqtt_puback_timeout_is_passed_to_the_paho_publish_wait(self) -> None:
+        client = FakeClient()
+        sender = Sender(
+            sender_config(
+                self.outbox_path, mqtt_puback_timeout=1.234, delivery_ack_timeout=5.0
+            ),
+            client_factory=client_factory_for(client),
+        )
+        self.addCleanup(sender.stop)
+        self.make_ready(sender, client)
+
+        info = FakePublishInfo(rc=0, published=True)
+        client.publish_results.append(info)
+
+        def ack_immediately(call) -> None:
+            envelope = MessageEnvelope.from_bytes(call["payload"])
+            client.emit_message(
+                sender.config.delivery_ack_topic,
+                DeliveryAck(envelope.message_id).to_bytes(),
+            )
+
+        client.publish_hook = ack_immediately
+        sender.publish("factory/data", 1, message_id="wiring-puback")
+
+        status = sender._process_oldest_once()
+
+        self.assertEqual(status, DeliveryStatus.DELIVERED)
+        # The exact configured mqtt_puback_timeout -- not the
+        # delivery_ack_timeout, not the library default -- must be what
+        # reaches Paho's own wait_for_publish().
+        self.assertEqual(info.wait_timeouts, [1.234])
+
+    def test_delivery_ack_timeout_governs_the_ack_wait_not_mqtt_puback_timeout(
+        self,
+    ) -> None:
+        client = FakeClient()
+        sender = Sender(
+            sender_config(
+                self.outbox_path, mqtt_puback_timeout=10.0, delivery_ack_timeout=0.05
+            ),
+            client_factory=client_factory_for(client),
+        )
+        self.addCleanup(sender.stop)
+        self.make_ready(sender, client)
+        # No publish_hook and no queued FakePublishInfo -- client.publish()
+        # falls back to a default FakePublishInfo(rc=0, published=True), so
+        # the MQTT PUBACK confirms instantly and only the DeliveryAck wait
+        # can be the bottleneck below.
+        sender.publish("factory/data", 1, message_id="wiring-ack")
+
+        started = time.monotonic()
+        status = sender._process_oldest_once()
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(status, DeliveryStatus.RETRY)
+        # Bounded well under mqtt_puback_timeout=10.0: if that field were
+        # governing this wait instead of delivery_ack_timeout=0.05, this
+        # assertion would fail (or the test would hang for ~10s).
+        self.assertLess(elapsed, 2.0)
 
 
 class SenderDeprecatedCompatTests(unittest.TestCase):

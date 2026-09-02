@@ -304,8 +304,8 @@ class Sender:
             if worker is not None and worker is not threading.current_thread():
                 worker.join(
                     timeout=(
-                        self.config.publish_timeout
-                        + self.config.ack_timeout
+                        self.config.mqtt_puback_timeout
+                        + self.config.delivery_ack_timeout
                         + 2.0
                     )
                 )
@@ -342,8 +342,8 @@ class Sender:
         This is honestly just the transport connection state -- it does
         **not** by itself mean reliomq is ready to deliver. Right after
         connecting there is a brief window where this is True but the
-        internal ACK subscription (which happens automatically) hasn't
-        finished yet. Don't poll this to decide whether to ``publish()`` --
+        internal DeliveryAck subscription (which happens automatically)
+        hasn't finished yet. Don't poll this to decide whether to ``publish()`` --
         that's always safe, even before :meth:`start`/:meth:`connect`. Use
         :meth:`wait_for_delivery`/:meth:`pending_count` to reason about
         delivery, not connection, state.
@@ -582,13 +582,13 @@ class Sender:
         self._wakeup.set()
         if ready:
             logger.debug(
-                "ACK subscription ready | topic=%s | mid=%s",
+                "DeliveryAck subscription ready | topic=%s | mid=%s",
                 self.config.delivery_ack_topic,
                 mid,
             )
         else:
             logger.warning(
-                "ACK subscription rejected | topic=%s | mid=%s",
+                "DeliveryAck subscription rejected | topic=%s | mid=%s",
                 self.config.delivery_ack_topic,
                 mid,
             )
@@ -625,7 +625,7 @@ class Sender:
         self._wakeup.set()
 
     def _request_ack_subscription(self, client=None) -> bool:
-        """Request/retry the ACK subscription, awaiting SUBACK before use."""
+        """Request/retry the DeliveryAck subscription, awaiting SUBACK before use."""
 
         if not self._connected.is_set() or self._stop_event.is_set():
             return False
@@ -660,7 +660,8 @@ class Sender:
             with self._subscription_lock:
                 self._subscription_mid = None
             logger.exception(
-                "ACK subscription request failed for %s", self.config.delivery_ack_topic
+                "DeliveryAck subscription request failed for %s",
+                self.config.delivery_ack_topic,
             )
             return False
 
@@ -669,7 +670,7 @@ class Sender:
                 self._subscription_mid = None
                 self._ack_subscription_ready.clear()
                 logger.warning(
-                    "ACK subscription request rejected | topic=%s | result=%s",
+                    "DeliveryAck subscription request rejected | topic=%s | result=%s",
                     self.config.delivery_ack_topic,
                     result,
                 )
@@ -727,9 +728,10 @@ class Sender:
                 return DeliveryStatus.STOPPED
 
             logger.debug(
-                "Publish attempt | message_id=%s | topic=%s",
+                "Publish attempt | message_id=%s | topic=%s | mqtt_puback_timeout=%s",
                 message_id,
                 self.config.relay_topic,
+                self.config.mqtt_puback_timeout,
             )
             published = confirmed_publish(
                 self.client,
@@ -737,31 +739,40 @@ class Sender:
                 envelope.to_bytes(),
                 qos=self.config.qos,
                 retain=False,
-                timeout=self.config.publish_timeout,
+                timeout=self.config.mqtt_puback_timeout,
             )
             if not published:
+                # Covers both an immediate broker-level rejection and the
+                # PUBACK simply never arriving within mqtt_puback_timeout --
+                # confirmed_publish() does not distinguish the two, and
+                # either way the outcome for the caller is identical: no
+                # confirmed PUBACK, so this attempt is retried.
                 return self._schedule_retry(
                     message_id,
-                    reason="broker publish not confirmed",
+                    reason="MQTT PUBACK not confirmed within mqtt_puback_timeout",
                 )
 
-            logger.debug("Broker publish confirmed (PUBACK) | message_id=%s", message_id)
+            logger.debug("MQTT PUBACK received | message_id=%s", message_id)
             logger.debug(
-                "Waiting for DeliveryAck | message_id=%s | timeout=%s",
+                "Waiting for DeliveryAck | message_id=%s | delivery_ack_timeout=%s",
                 message_id,
-                self.config.ack_timeout,
+                self.config.delivery_ack_timeout,
             )
 
-            if not self._ack_tracker.wait(self.config.ack_timeout):
+            if not self._ack_tracker.wait(self.config.delivery_ack_timeout):
                 if self._stop_event.is_set():
                     logger.debug(
                         "DeliveryAck wait interrupted by shutdown | message_id=%s",
                         message_id,
                     )
                     return DeliveryStatus.STOPPED
+                # Covers both delivery_ack_timeout actually elapsing and the
+                # wait being interrupted by an unrelated disconnect (not a
+                # shutdown, handled above) -- either way the message stays
+                # in the Outbox and this attempt is retried.
                 return self._schedule_retry(
                     message_id,
-                    reason="DeliveryAck timeout or interruption",
+                    reason="DeliveryAck not confirmed within delivery_ack_timeout",
                 )
 
             logger.info("DeliveryAck received | message_id=%s", message_id)
@@ -812,7 +823,7 @@ class Sender:
             reason,
         )
         logger.info(
-            "Retry scheduled | message_id=%s | attempt=%s | delay=%s",
+            "Delivery retry scheduled | message_id=%s | attempt=%s | delay=%s",
             message_id,
             attempt,
             self.config.retry_interval,

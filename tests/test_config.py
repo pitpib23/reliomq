@@ -22,6 +22,8 @@ class SenderConfigTests(unittest.TestCase):
         self.assertEqual(config.qos, 1)
         self.assertEqual(config.relay_topic, "reliomq/messages")
         self.assertEqual(config.delivery_ack_topic, "reliomq/acks")
+        self.assertEqual(config.mqtt_puback_timeout, 2.0)
+        self.assertEqual(config.delivery_ack_timeout, 3.0)
         self.assertIsInstance(config.outbox_path, Path)
         self.assertIsNone(config.client_id)
         self.assertIsNone(config.log_level)
@@ -69,7 +71,13 @@ class SenderConfigTests(unittest.TestCase):
     def test_rejects_non_positive_or_non_finite_timeouts(self) -> None:
         for value in (0, -1.0, float("inf"), float("nan")):
             with self.subTest(value=value), self.assertRaises(ConfigError):
-                SenderConfig(host="broker", outbox_path="q.jsonl", ack_timeout=value)
+                SenderConfig(
+                    host="broker", outbox_path="q.jsonl", delivery_ack_timeout=value
+                )
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                SenderConfig(
+                    host="broker", outbox_path="q.jsonl", mqtt_puback_timeout=value
+                )
 
     def test_rejects_reconnect_minimum_greater_than_maximum(self) -> None:
         with self.assertRaises(ConfigError):
@@ -174,6 +182,40 @@ class SenderConfigDeprecatedCompatTests(unittest.TestCase):
         self.assertEqual(config.delivery_ack_topic, "legacy/ack")
         with self.assertWarns(DeprecationWarning):
             self.assertEqual(config.ack_topic, "legacy/ack")
+
+    def test_delivery_ack_timeout_keyword_still_works_and_warns(self) -> None:
+        with self.assertWarns(DeprecationWarning):
+            config = SenderConfig(host="broker", outbox_path="q.jsonl", ack_timeout=9.0)
+
+        self.assertEqual(config.delivery_ack_timeout, 9.0)
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(config.ack_timeout, 9.0)
+
+    def test_mqtt_puback_timeout_keyword_still_works_and_warns(self) -> None:
+        with self.assertWarns(DeprecationWarning):
+            config = SenderConfig(host="broker", outbox_path="q.jsonl", publish_timeout=4.0)
+
+        self.assertEqual(config.mqtt_puback_timeout, 4.0)
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(config.publish_timeout, 4.0)
+
+    def test_conflicting_delivery_ack_timeout_and_ack_timeout_raise(self) -> None:
+        with self.assertRaises(ConfigError):
+            SenderConfig(
+                host="broker",
+                outbox_path="q.jsonl",
+                delivery_ack_timeout=1.0,
+                ack_timeout=2.0,
+            )
+
+    def test_conflicting_mqtt_puback_timeout_and_publish_timeout_raise(self) -> None:
+        with self.assertRaises(ConfigError):
+            SenderConfig(
+                host="broker",
+                outbox_path="q.jsonl",
+                mqtt_puback_timeout=1.0,
+                publish_timeout=2.0,
+            )
 
     def test_publisher_config_alias_still_constructs_and_warns(self) -> None:
         with self.assertWarns(DeprecationWarning):

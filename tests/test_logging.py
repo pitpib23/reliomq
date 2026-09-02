@@ -228,11 +228,39 @@ class LifecycleLogContentTests(unittest.TestCase):
         for expected in (
             "Delivery attempt starting",
             "Publish attempt",
-            "Broker publish confirmed (PUBACK)",
+            "mqtt_puback_timeout=",
+            "MQTT PUBACK received",
             "Waiting for DeliveryAck",
+            "delivery_ack_timeout=",
             "Matching DeliveryAck received",
         ):
             self.assertIn(expected, joined, f"missing expected DEBUG line: {expected!r}")
+
+    def test_mqtt_puback_and_delivery_ack_timeouts_are_named_distinctly_in_logs(
+        self,
+    ) -> None:
+        """Regression: a reader must be able to tell which layer's timeout
+        governs a given log line without reading the source -- see the
+        README's "Timeouts, ACKs, and Blocking Behavior" section."""
+
+        sender, client = self._wire_sender()
+
+        with self.assertLogs("reliomq", level="DEBUG") as captured:
+            sender.start()
+            client.emit_connect()
+            client.emit_latest_suback((1,))
+            message_id = sender.publish("factory/x", {"v": 1})
+            self.assertTrue(sender.wait_for_delivery(message_id, timeout=2.0))
+            sender.stop()
+
+        joined = "\n".join(captured.output)
+        # Neither of these unqualified, layer-ambiguous phrases should
+        # appear anywhere in the log output.
+        self.assertNotIn("ack timeout", joined.lower())
+        self.assertNotIn("publish timeout", joined.lower())
+        # Each timeout-governed line must name its own layer explicitly.
+        self.assertIn("mqtt_puback_timeout=", joined)
+        self.assertIn("delivery_ack_timeout=", joined)
 
     def test_retry_is_visible_at_info_with_reason_at_warning(self) -> None:
         client = FakeClient()
@@ -240,8 +268,8 @@ class LifecycleLogContentTests(unittest.TestCase):
             SenderConfig(
                 host="h",
                 outbox_path=self.outbox_path,
-                ack_timeout=0.02,
-                publish_timeout=0.02,
+                delivery_ack_timeout=0.02,
+                mqtt_puback_timeout=0.02,
                 retry_interval=0.02,
             ),
             client_factory=client_factory_for(client),
@@ -257,12 +285,17 @@ class LifecycleLogContentTests(unittest.TestCase):
 
         self.assertEqual(status, DeliveryStatus.RETRY)
         joined = "\n".join(captured.output)
-        self.assertIn("Retry scheduled", joined)
+        self.assertIn("Delivery retry scheduled", joined)
         self.assertIn("retry-me", joined)
         self.assertIn("attempt=1", joined)
         warning_lines = [line for line in captured.output if "WARNING" in line]
         self.assertTrue(
             any("Delivery attempt failed" in line for line in warning_lines)
+        )
+        # The warning must say which layer's ACK failed to arrive -- not a
+        # bare, ambiguous "ack timeout".
+        self.assertTrue(
+            any("DeliveryAck" in line for line in warning_lines)
         )
 
     def test_relay_forwarding_logs_use_relay_and_delivery_ack_vocabulary(self) -> None:

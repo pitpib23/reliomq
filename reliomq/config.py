@@ -13,6 +13,17 @@ are durably queued), ``relay_topic`` (the transport topic a :class:`Relay`
 reads from), ``delivery_ack_topic`` (where the end-to-end acknowledgement
 comes back on).
 
+``SenderConfig`` has two internal, background-worker timeouts that are
+deliberately named after exactly what each one waits for, since "which
+ACK?" is not a rhetorical question in a two-layer acknowledgement protocol:
+``mqtt_puback_timeout`` (the MQTT/Paho QoS 1 PUBACK for one publish
+attempt) and ``delivery_ack_timeout`` (reliomq's own end-to-end
+:class:`~reliomq.protocol.DeliveryAck`, published by a
+:class:`~reliomq.relay.Relay`). Neither blocks your calling thread -- that
+is what :meth:`Sender.wait_for_delivery`'s own ``timeout=`` is for. See the
+README's "Timeouts, ACKs, and Blocking Behavior" section for the full
+picture.
+
 Every field is validated eagerly in ``__post_init__``: an invalid config
 raises :class:`ConfigError` immediately at construction, never silently
 later during a connection attempt.
@@ -189,10 +200,10 @@ class SenderConfig:
     relay_topic: str
     delivery_ack_topic: str
     qos: int
-    ack_timeout: float
+    delivery_ack_timeout: float
     retry_interval: float
     keepalive: int
-    publish_timeout: float
+    mqtt_puback_timeout: float
     reconnect_min_delay: float
     reconnect_max_delay: float
     log_level: int | None
@@ -207,10 +218,10 @@ class SenderConfig:
         relay_topic: str | None = None,
         delivery_ack_topic: str | None = None,
         qos: int = 1,
-        ack_timeout: float = 3.0,
+        delivery_ack_timeout: float | None = None,
         retry_interval: float = 10.0,
         keepalive: int = 60,
-        publish_timeout: float = 2.0,
+        mqtt_puback_timeout: float | None = None,
         reconnect_min_delay: float = 1.0,
         reconnect_max_delay: float = 60.0,
         log_level: int | str | None = None,
@@ -220,6 +231,8 @@ class SenderConfig:
         envelope_topic: str | None = None,
         data_topic: str | None = None,
         ack_topic: str | None = None,
+        ack_timeout: float | None = None,
+        publish_timeout: float | None = None,
     ) -> None:
         resolved_outbox_path = resolve_renamed_argument(
             new_value=outbox_path,
@@ -250,6 +263,24 @@ class SenderConfig:
             default=DEFAULT_DELIVERY_ACK_TOPIC,
             error_cls=ConfigError,
         )
+        resolved_delivery_ack_timeout = resolve_renamed_argument(
+            new_value=delivery_ack_timeout,
+            old_value=ack_timeout,
+            new_name="delivery_ack_timeout",
+            old_name="ack_timeout",
+            owner="SenderConfig",
+            default=3.0,
+            error_cls=ConfigError,
+        )
+        resolved_mqtt_puback_timeout = resolve_renamed_argument(
+            new_value=mqtt_puback_timeout,
+            old_value=publish_timeout,
+            new_name="mqtt_puback_timeout",
+            old_name="publish_timeout",
+            owner="SenderConfig",
+            default=2.0,
+            error_cls=ConfigError,
+        )
 
         object.__setattr__(self, "host", host)
         object.__setattr__(self, "outbox_path", resolved_outbox_path)
@@ -258,10 +289,10 @@ class SenderConfig:
         object.__setattr__(self, "relay_topic", resolved_relay_topic)
         object.__setattr__(self, "delivery_ack_topic", resolved_delivery_ack_topic)
         object.__setattr__(self, "qos", qos)
-        object.__setattr__(self, "ack_timeout", ack_timeout)
+        object.__setattr__(self, "delivery_ack_timeout", resolved_delivery_ack_timeout)
         object.__setattr__(self, "retry_interval", retry_interval)
         object.__setattr__(self, "keepalive", keepalive)
-        object.__setattr__(self, "publish_timeout", publish_timeout)
+        object.__setattr__(self, "mqtt_puback_timeout", resolved_mqtt_puback_timeout)
         object.__setattr__(self, "reconnect_min_delay", reconnect_min_delay)
         object.__setattr__(self, "reconnect_max_delay", reconnect_max_delay)
         object.__setattr__(self, "log_level", log_level)
@@ -285,7 +316,9 @@ class SenderConfig:
             raise ConfigError("relay_topic and delivery_ack_topic must be different")
         object.__setattr__(self, "qos", _qos_one(self.qos))
         object.__setattr__(
-            self, "ack_timeout", _positive_number(self.ack_timeout, "ack_timeout")
+            self,
+            "delivery_ack_timeout",
+            _positive_number(self.delivery_ack_timeout, "delivery_ack_timeout"),
         )
         object.__setattr__(
             self,
@@ -295,8 +328,8 @@ class SenderConfig:
         object.__setattr__(self, "keepalive", _keepalive(self.keepalive))
         object.__setattr__(
             self,
-            "publish_timeout",
-            _positive_number(self.publish_timeout, "publish_timeout"),
+            "mqtt_puback_timeout",
+            _positive_number(self.mqtt_puback_timeout, "mqtt_puback_timeout"),
         )
         reconnect_minimum = _positive_number(
             self.reconnect_min_delay, "reconnect_min_delay"
@@ -347,6 +380,24 @@ class SenderConfig:
             owner="SenderConfig", old_name="ack_topic", new_name="delivery_ack_topic"
         )
         return self.delivery_ack_topic
+
+    @property
+    def ack_timeout(self) -> float:
+        """Deprecated alias for :attr:`delivery_ack_timeout`."""
+
+        warn_deprecated_attribute(
+            owner="SenderConfig", old_name="ack_timeout", new_name="delivery_ack_timeout"
+        )
+        return self.delivery_ack_timeout
+
+    @property
+    def publish_timeout(self) -> float:
+        """Deprecated alias for :attr:`mqtt_puback_timeout`."""
+
+        warn_deprecated_attribute(
+            owner="SenderConfig", old_name="publish_timeout", new_name="mqtt_puback_timeout"
+        )
+        return self.mqtt_puback_timeout
 
 
 class PublisherConfig(SenderConfig):

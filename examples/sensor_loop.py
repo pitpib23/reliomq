@@ -49,7 +49,7 @@ def main() -> None:
         outbox_path="sensor_pending.jsonl",
         relay_topic="reliable/ingress",
         delivery_ack_topic="reliable/acks",
-        ack_timeout=3.0,
+        delivery_ack_timeout=3.0,
         retry_interval=10.0,
         log_level="INFO",
     )

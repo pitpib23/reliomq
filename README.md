@@ -33,6 +33,23 @@ Requires **Python 3.11+** and **Paho MQTT 2.x**.
 > at their replacement. See [Migrating to 0.3.0](#migrating-to-030) below
 > and [CHANGELOG.md](CHANGELOG.md) for the full picture.
 
+## I want to...
+
+| I want to... | Use... |
+|---|---|
+| Publish sensor/telemetry data reliably | `sender.publish()` — see [Publishing](#publishing) |
+| Continue collecting data while MQTT/network is unavailable | Just keep calling `sender.publish()`; the Outbox and background retry handle the rest — see [Temporary network outage](#5-temporary-network-outage) |
+| Know whether one specific message completed | `sender.wait_for_delivery(message_id, timeout=...)` |
+| See whether messages are backing up | `sender.pending_count()` |
+| Move reliably-delivered messages between a source and destination broker | `Relay` — see [Relay integration](#relay-integration) |
+| Diagnose why a message is stuck | `debug=True` + trace its `message_id` in the logs — see [Debugging a stuck message](#4-debugging-a-stuck-message) |
+| Tune how long reliomq waits for the MQTT broker's QoS 1 PUBACK | `mqtt_puback_timeout` |
+| Tune how long reliomq waits for its own `DeliveryAck` from `Relay` | `delivery_ack_timeout` |
+| Change how quickly failed/pending deliveries retry | `retry_interval` |
+
+See [Timeouts, ACKs, and Blocking Behavior](#timeouts-acks-and-blocking-behavior)
+and [What to Use and When](#what-to-use-and-when) below for the full picture.
+
 ## Why not just `qos=1`?
 
 QoS 1 only proves the broker your process is directly connected to accepted
@@ -96,6 +113,69 @@ your process crashing and restarting mid-delivery — in every one of those
 cases, "network said OK" was never good enough on its own, so nothing was
 deleted. See [Persistence and restart recovery](#persistence-and-restart-recovery)
 for the on-disk details.
+
+## Timeouts, ACKs, and Blocking Behavior
+
+There are three separate waits in reliomq, and mixing them up is the single
+easiest way to misread a log or misconfigure a deployment. Each is named
+after exactly what it waits for, on purpose:
+
+| Name | Waits for | Layer | Runs where? | Blocks user code? | What happens on timeout? |
+|---|---|---|---|---|---|
+| `mqtt_puback_timeout` | The MQTT QoS 1 PUBACK for **one** publish attempt | MQTT / Paho | reliomq's background delivery worker thread | No | That attempt is retried: logged, the message stays in the Outbox, the worker tries again after `retry_interval`. |
+| `delivery_ack_timeout` | reliomq's own `DeliveryAck`, published by `Relay` | reliomq protocol | reliomq's background delivery worker thread | No | Same retry: the message stays in the Outbox and is retried after `retry_interval`. |
+| `wait_for_delivery(..., timeout=N)` | The **entire** delivery workflow finishing for one message -- both waits above, however many retries it takes | Application / caller | The thread that called `wait_for_delivery()` | **Yes** | Returns `False` to the caller. The message stays in the Outbox and the background worker keeps retrying it exactly as before -- this timeout has no effect on that. |
+
+`mqtt_puback_timeout` and `delivery_ack_timeout` are both `SenderConfig`
+fields that tune internal, background retry behavior; neither one is ever
+awaited by your own code. `wait_for_delivery(timeout=...)`'s `timeout=` is
+the only one of the three that belongs to the caller.
+
+### Two threads, not one
+
+```text
+YOUR APPLICATION THREAD              RELIOMQ BACKGROUND (delivery worker thread)
+
+message_id = sender.publish(...)
+        |
+        |  durably fsync'd
+        └───────────────────────►   Outbox: message stored
+                                     |
+                                     |  worker wakes, picks the oldest message
+                                     v
+                                     MQTT publish attempt
+                                     |
+                                     |  wait up to mqtt_puback_timeout
+                                     v
+                                     MQTT PUBACK
+                                     |    (timeout instead? -> retry after retry_interval)
+                                     |  wait up to delivery_ack_timeout
+                                     v
+                                     DeliveryAck
+                                     |    (timeout instead? -> retry after retry_interval)
+                                     v
+                                     message removed from Outbox
+
+
+sender.wait_for_delivery(
+    message_id,
+    timeout=30,
+)
+        |
+        |  BLOCKS THIS THREAD HERE, up to `timeout` seconds
+        |
+        +-- delivery completes --------> returns True
+        |
+        +-- timeout expires ------------> returns False
+                                           (the worker above keeps retrying;
+                                            this timeout does not stop it)
+```
+
+`publish()` never touches the background thread directly — it only writes
+to the Outbox and wakes the worker up. The worker (one per `Sender`, named
+`reliomq-sender`) is the only thing that ever runs an MQTT publish attempt
+or waits for either ACK; it runs for the lifetime of the sender, independent
+of whether anything ever calls `wait_for_delivery()`.
 
 ## Architecture overview
 
@@ -168,8 +248,8 @@ no-op. `Relay` manages *two* Paho clients (one per broker), so its
 - **Automatic restart recovery** — a fresh process just opens the same
   Outbox file and continues exactly where the last one left off.
 - **Automatic retry** on broker outage, network failure, publish errors,
-  publish-confirmation timeout, and DeliveryAck timeout — nothing is
-  deleted on any of these.
+  `mqtt_puback_timeout` expiry, and `delivery_ack_timeout` expiry — nothing
+  is deleted on any of these.
 - **Optional `Relay` component** that forwards between two brokers and
   only ACKs the source *after* the destination publish is confirmed —
   never before.
@@ -400,13 +480,24 @@ produces no DeliveryAck; the sender still owns the durable record and
 retries it. Deploy only one ordinary relay subscriber per route unless
 duplicate forwarding is intended.
 
-## Cookbook
+## Common Usage Patterns
 
-### Generic sensor loop
+### 1. Fire-and-continue telemetry
 
-The normal long-running pattern — one `Sender`, created once, publishing on
-an interval (full runnable version in
-[examples/sensor_loop.py](examples/sensor_loop.py)):
+```python
+message_id = sender.publish("factory/sensor-01", payload)
+```
+
+Use for: sensors, telemetry, periodic readings, continuous data collection
+-- anything where the application should keep producing data rather than
+pause for each one. reliomq durably stores and retries each message in the
+background; the caller never blocks on the network. **Do not** call
+`wait_for_delivery()` after every reading in a loop like this -- it would
+serialize every reading behind a network round trip. The application should
+normally keep collecting data at its own pace.
+
+Full runnable version, including graceful shutdown and a backlog warning:
+[examples/sensor_loop.py](examples/sensor_loop.py):
 
 ```python
 sender = Sender(config)
@@ -423,17 +514,136 @@ finally:
     sender.disconnect()
 ```
 
-### Modbus TCP sensor
+A realistic version of this same pattern reading real hardware over Modbus
+TCP (read-only -- it only ever calls `read_holding_registers()`, never a
+write) is in [examples/modbus_sensor.py](examples/modbus_sensor.py); it
+requires the optional `pymodbus` package (`pip install pymodbus`) --
+reliomq itself has no Modbus or hardware dependency.
 
-A realistic read-only Modbus TCP poller bridged to MQTT is in
-[examples/modbus_sensor.py](examples/modbus_sensor.py). It only ever calls
-`read_holding_registers()` (no writes), initializes both the Modbus client
-and the `Sender` once, and shows: periodic polling, payload construction,
-INFO logging, error handling around individual reads, graceful
-`KeyboardInterrupt`/`SIGTERM` shutdown, and why offline-MQTT and
-process-restart are both non-events for data already collected. It requires
-the optional `pymodbus` package (`pip install pymodbus`) — reliomq itself
-has no Modbus or hardware dependency.
+### 2. Publish and require confirmation
+
+```python
+message_id = sender.publish("factory/critical-event", payload)
+
+if not sender.wait_for_delivery(message_id, timeout=30):
+    handle_still_pending(message_id)
+```
+
+Use for: critical events, workflows where the next action genuinely depends
+on successful delivery, or any case where synchronous confirmation is
+required before proceeding. **`wait_for_delivery()` blocks the calling
+thread** for up to `timeout` seconds; the message stays safely in the
+Outbox and reliomq's background worker keeps retrying it independent of
+whether/how this call returns.
+
+### 3. Operational monitoring
+
+```python
+pending = sender.pending_count()
+```
+
+Use for health checks, metrics, dashboards, and alerting on a growing
+backlog. `pending_count()` never blocks. See
+[`sender.pending_count()`](#senderpending_count) above for what a rising
+count can indicate.
+
+### 4. Debugging a stuck message
+
+Turn on `debug=True` (equivalent to `log_level="DEBUG"`), then trace one
+`message_id` through the sequence it should follow:
+
+```
+saved to Outbox            (INFO  "Message stored in Outbox")
+MQTT publish attempt       (DEBUG "Publish attempt ... mqtt_puback_timeout=...")
+MQTT PUBACK                (DEBUG "MQTT PUBACK received")
+waiting for DeliveryAck    (DEBUG "Waiting for DeliveryAck ... delivery_ack_timeout=...")
+DeliveryAck received       (INFO  "DeliveryAck received")
+removed from Outbox        (INFO  "Message completed")
+```
+
+Wherever the sequence stops tells you what to look at:
+
+- **Stops after "saved to Outbox", no publish attempt appears:** the sender
+  isn't connected/ready yet -- check `sender.is_connected()` and for
+  `MQTT connection` WARNING lines.
+- **Stops after "MQTT publish attempt", no PUBACK:** the source broker
+  isn't reachable, or is rejecting the publish -- look for
+  `MQTT PUBACK not confirmed within mqtt_puback_timeout`; consider raising
+  `mqtt_puback_timeout` only if this is a genuine latency issue, not an
+  outage.
+- **Stops after "MQTT PUBACK received", no DeliveryAck:** the message
+  reached the source broker, but nothing sent a `DeliveryAck` back -- is a
+  `Relay` actually running and subscribed to this `relay_topic`? Is *its*
+  destination publish succeeding? Look for
+  `DeliveryAck not confirmed within delivery_ack_timeout` and, on the
+  relay's own logs, `Relay forwarded` / `DeliveryAck sent`.
+- **Repeats "Delivery retry scheduled" indefinitely:** the message is
+  durably safe in the Outbox but something downstream is never completing
+  -- this is exactly what `pending_count()` would show growing.
+
+### 5. Temporary network outage
+
+When the source broker, the destination broker, or `Relay` itself becomes
+unavailable — or a `DeliveryAck` simply stops coming back — the
+application can keep calling `sender.publish(...)` normally. `publish()`
+only ever fails for a genuine local Outbox write failure (`OutboxError`),
+never because the network is down. Every message durably queues, and the
+background worker keeps retrying whatever is at the head of the Outbox
+until connectivity (or `Relay`, or the destination) returns, at which point
+delivery drains automatically, oldest-first, with no message lost.
+
+### 6. Graceful shutdown
+
+```python
+sender.loop_stop()
+sender.disconnect()
+```
+
+What happens: intake stops immediately; if a delivery attempt is
+in-flight, `disconnect()`/`stop()` interrupts its ACK wait (without ever
+deleting that message's durable record) and waits for the worker thread to
+finish before returning. Any message still pending when the process exits
+remains fully persisted in the Outbox — nothing in-flight is lost. On the
+next process start, constructing `Sender` with the same `outbox_path`
+picks up exactly where the previous run left off, including that same
+message under its same `message_id`.
+
+### 7. When Relay is required
+
+`Relay` is required whenever you need reliomq's actual end-to-end
+guarantee -- a `DeliveryAck` only exists because something implementing the
+protocol produced one:
+
+```text
+Sender
+    |
+    v
+source broker
+    |
+    v
+Relay
+    |
+    v
+destination broker
+    |
+    v
+DeliveryAck
+    |
+    v
+Sender
+```
+
+A plain `mosquitto_sub` (or any plain MQTT subscriber) on the destination
+topic does **not** generate a `DeliveryAck` -- it just receives the
+message. Without a `Relay` (or your own code speaking the same wire
+protocol) subscribed to the `relay_topic` and publishing `DeliveryAck`s
+back, a `Sender`'s messages will durably queue and retry *forever*, since
+nothing will ever confirm them. There is no "direct mode" that skips
+`Relay` while keeping end-to-end confirmation -- if you only need durable,
+retried delivery *to one broker* (QoS 1 plus persistence, without a second
+hop or an application-level ACK), that is a materially weaker guarantee
+than what this library is for; reliomq does not currently offer that as a
+separate mode.
 
 ## Wire protocol
 
@@ -526,9 +736,9 @@ credentials.
 | `relay_topic` | `reliomq/messages` | Topic the sender sends its envelope on (not the application topic) |
 | `delivery_ack_topic` | `reliomq/acks` | Topic the sender listens on for DeliveryAcks |
 | `qos` | `1` | Fixed at 1 |
-| `ack_timeout` | `3.0`s | How long to wait for the DeliveryAck |
-| `publish_timeout` | `2.0`s | How long to wait for MQTT publish confirmation |
-| `retry_interval` | `10.0`s | Delay between retries after a failure |
+| `delivery_ack_timeout` | `3.0`s | Background wait for reliomq's own `DeliveryAck` (see below) |
+| `mqtt_puback_timeout` | `2.0`s | Background wait for the MQTT QoS 1 PUBACK (see below) |
+| `retry_interval` | `10.0`s | Delay between retries after a failure (see below) |
 | `keepalive` | `60`s | MQTT keepalive |
 | `reconnect_min_delay` / `reconnect_max_delay` | `1.0`s / `60.0`s | Paho reconnect backoff range |
 | `log_level` | `None` | `"DEBUG"`/`"INFO"`/... or a `logging` level int; `None` leaves logging exactly as-is (see [Logging](#logging)) |
@@ -551,6 +761,21 @@ credentials.
 | `max_queue_size` | `1000` | Bound on the relay's in-memory handoff queue |
 | `log_level` | `None` | Same as `SenderConfig.log_level` |
 | `debug` | `False` | Same as `SenderConfig.debug` |
+
+### Timeout and retry settings in detail
+
+| Setting | Default | Unit | Controls | Layer | Where it runs | Blocks caller? | Normal usage |
+|---|---|---|---|---|---|---|---|
+| `SenderConfig.mqtt_puback_timeout` | `2.0` | seconds | How long one publish attempt waits for the broker's QoS 1 PUBACK | MQTT / Paho | Background delivery worker | No | Leave at the default. Raise it if logs show recurring `MQTT PUBACK not confirmed` retries against a broker/network with genuinely higher latency than 2s. |
+| `SenderConfig.delivery_ack_timeout` | `3.0` | seconds | How long one publish attempt waits for reliomq's own `DeliveryAck` after the PUBACK | reliomq protocol | Background delivery worker | No | Leave at the default. Raise it if `Relay`-to-destination latency is high and logs show `DeliveryAck not confirmed` retries that keep just missing the window. |
+| `RelayConfig.destination_publish_timeout` | `2.0` | seconds | How long the relay waits for the destination broker's PUBACK | MQTT / Paho | `Relay`'s forwarding worker | No | Leave at the default; same tuning logic as `mqtt_puback_timeout`, for the destination broker specifically. |
+| `RelayConfig.source_ack_publish_timeout` | `0.5` | seconds | How long the relay waits for its own `DeliveryAck` publish to be PUBACK'd on the source broker | MQTT / Paho | `Relay`'s forwarding worker | No | Leave at the default. |
+| `retry_interval` (both configs) | `10.0` | seconds | Delay before retrying after any failure (PUBACK timeout, DeliveryAck timeout, disconnect) | reliomq | Background worker | No | Leave at the default. Increase for long expected outages or to reduce retry traffic; decrease if brokers/network can absorb faster retries and you want quicker recovery. |
+| `Sender.wait_for_delivery(timeout=N)` | `None` (wait forever) | seconds | How long **your thread** blocks waiting for one message's entire workflow | Application / caller | Your calling thread | **Yes** | Set this per call based on how long that specific workflow can afford to wait -- there is no library-wide default to tune. |
+
+None of the background timeouts need to change for normal operation; they
+exist to be tuned only when logs show a specific, recurring problem (see
+[Debugging a stuck message](#4-debugging-a-stuck-message)).
 
 ## Logging
 
@@ -626,15 +851,20 @@ own `mid`, `MQTT publish`) rather than being forced into reliomq's
 vocabulary — precision matters more than consistency at this layer:
 
 - each delivery attempt starting, with its attempt number;
-- the publish attempt and the MQTT PUBACK confirmation, separately from the
-  DeliveryAck;
-- waiting for the DeliveryAck, and ACK matching (including *why* a
-  stale/late/wrong-ID/malformed one was ignored);
+- the publish attempt (tagged with the exact `mqtt_puback_timeout` in
+  effect) and `MQTT PUBACK received`, logged as its own distinct line from
+  the DeliveryAck below;
+- `Waiting for DeliveryAck` (tagged with the exact `delivery_ack_timeout` in
+  effect), and DeliveryAck matching -- including *why* a
+  stale/late/wrong-ID/malformed one was ignored;
 - Outbox-level decisions (append, duplicate-ID skip, removal);
 - MQTT client creation and subscription bookkeeping, including Paho's own
   `mid` (packet identifier) where relevant — deliberately not renamed to
   `message_id`, since it is a different concept at a different layer.
 
+Every timeout-governed DEBUG line names its own config field explicitly
+(`mqtt_puback_timeout=...` or `delivery_ack_timeout=...`) rather than a bare
+"timeout" — see [Timeouts, ACKs, and Blocking Behavior](#timeouts-acks-and-blocking-behavior).
 Payloads and credentials are never logged, at any level — only
 `message_id`s, topics, and counts. That's deliberate: DEBUG should never
 require an opt-in beyond the level itself to be safe to turn on in
@@ -643,12 +873,162 @@ production.
 **WARNING** — recoverable trouble that's expected during normal outage
 handling: disconnects, rejected subscriptions, late/malformed/wrong-ID
 DeliveryAcks ignored, forward failures, a full relay queue, and the reason
-a delivery attempt is being retried. Nothing is lost when you see these.
+a delivery attempt is being retried -- always phrased as either
+`MQTT PUBACK not confirmed within mqtt_puback_timeout` or
+`DeliveryAck not confirmed within delivery_ack_timeout`, never an
+unqualified "ack timeout". Nothing is lost when you see these.
 
 **ERROR** (some via `logger.exception()`, with a traceback) — things that
 should not happen: the worker failing to stop promptly on shutdown, a
 DeliveryAck matching a message that turned out not to be the Outbox oldest,
 or an unexpected exception in the delivery/forward loop.
+
+## What to Use and When
+
+A decision table for every supported public tool. "Background?" means it
+runs (or configures) work on reliomq's own worker thread, independent of
+your code; "Blocks caller?" means calling it can pause the thread that
+called it.
+
+| Tool | What it is | Background? | Blocks caller? |
+|---|---|---|---|
+| `Sender` / `SenderConfig` | The main entry point: durable, retried, end-to-end-acknowledged publishing | Owns one background worker | No (construction/config only) |
+| `Relay` / `RelayConfig` | Optional end-to-end forwarder between two brokers | Owns one background worker | No (construction/config only) |
+| `Outbox` | The durable on-disk queue underneath `Sender` | N/A (a data store, not a process) | Briefly, for its own file I/O locking -- negligible |
+| `DeliveryAck` | The wire-protocol shape of reliomq's own end-to-end acknowledgement | N/A (a data class) | N/A |
+| `sender.publish()` | Durably store one message and hand it to the background worker | Triggers background work | No -- only waits for the local Outbox write |
+| `sender.wait_for_delivery()` | Block until one message (or the whole Outbox) finishes | No -- it only *observes* background work | **Yes** |
+| `sender.pending_count()` | Read the current Outbox backlog size | No | No |
+| `sender.connect()` / `.start()` / `.loop_start()` | Start the MQTT connection + background worker (one operation, three names) | Starts background work | Briefly, for connection setup |
+| `sender.disconnect()` / `.stop()` / `.loop_stop()` | Stop cleanly, joining the background worker | Stops background work | Briefly, waiting for the worker to finish its current attempt |
+| `mqtt_puback_timeout` | Config: MQTT PUBACK wait per attempt | Governs background work | No |
+| `delivery_ack_timeout` | Config: DeliveryAck wait per attempt | Governs background work | No |
+| `retry_interval` | Config: delay between retries | Governs background work | No |
+| `log_level="INFO"` | Config: lifecycle narration | N/A (logging config) | No |
+| `log_level="DEBUG"` | Config: full diagnostic detail, per `message_id` | N/A (logging config) | No |
+
+### `Sender`
+
+**What it does:** durably stores every `publish()`ed message and retries it
+-- across reconnects and process restarts -- until a `DeliveryAck`
+confirms it.
+
+**Use when:**
+- your application needs reliable publishing that survives a crash or a
+  temporary MQTT/network outage;
+- data must be persisted before delivery is attempted;
+- you want automatic retry without writing that logic yourself.
+
+**Do not use when:**
+- plain `paho-mqtt` is already enough for your use case (no durability or
+  end-to-end confirmation needed);
+- losing a message during an outage is genuinely acceptable;
+- you don't need reliomq's delivery workflow at all -- a raw `Client` is
+  simpler.
+
+**Background:** owns one delivery-worker thread for its whole lifetime
+(started by `connect()`/`start()`/`loop_start()`).
+
+**Example:** see [Getting started](#getting-started).
+
+### `sender.wait_for_delivery()`
+
+**What it does:** waits for one message to complete reliomq's full delivery
+workflow (PUBACK **and** DeliveryAck).
+
+**Use when:**
+- the next step in your application genuinely depends on confirmed
+  delivery;
+- a critical workflow requires synchronous confirmation before continuing;
+- the caller intentionally wants to wait for exactly one message.
+
+**Do not use when:**
+- continuously reading sensors or publishing telemetry;
+- inside a high-frequency loop -- blocking on every message serializes
+  your whole data-collection rate behind network round trips;
+- you only want to *monitor* backlog, not block on it (use
+  `pending_count()` instead).
+
+**Background:** No -- reliomq's own background delivery continues
+independently of this call either way.
+
+**Blocks calling thread:** **YES.**
+
+**Example:**
+
+```python
+message_id = sender.publish("factory/machine1/data", payload)
+if not sender.wait_for_delivery(message_id, timeout=30):
+    handle_still_pending(message_id)
+```
+
+### `sender.pending_count()`
+
+**What it does:** returns the current number of messages still in the
+Outbox awaiting delivery.
+
+**Use when:**
+- checking operational health;
+- exposing a backlog metric or building a dashboard/health endpoint;
+- alerting on a growing backlog;
+- troubleshooting why data doesn't seem to be clearing.
+
+An increasing count can indicate: the source broker is unavailable, `Relay`
+is unavailable, the destination broker is unavailable, `DeliveryAck`s
+aren't returning, or some other connectivity/retry problem — pair it with
+DEBUG logging to find out which.
+
+**Background:** No.
+
+**Blocks calling thread:** No (besides negligible internal
+synchronization).
+
+**Example:**
+
+```python
+pending = sender.pending_count()
+if pending > 50:
+    logging.warning("delivery backlog: %s messages pending", pending)
+```
+
+### `mqtt_puback_timeout`
+
+**Use for:** controlling how long reliomq waits for the MQTT QoS 1 PUBACK
+during one delivery attempt.
+
+**Normally:** leave the default (`2.0`s).
+
+**Change it when:** the broker/network is unusually slow, logs show
+recurring `MQTT PUBACK not confirmed` retries, or your latency
+characteristics justify a larger or smaller value.
+
+**INTERNAL / BACKGROUND. DOES NOT BLOCK USER CODE.**
+
+### `delivery_ack_timeout`
+
+**Use for:** controlling how long reliomq waits for its own `DeliveryAck`
+from `Relay`.
+
+**Normally:** leave the default (`3.0`s).
+
+**Change it when:** `Relay`-to-destination latency is high, `DeliveryAck`s
+frequently arrive just after the current timeout, or logs show repeated
+`DeliveryAck not confirmed` retry behavior.
+
+**INTERNAL / BACKGROUND. DOES NOT BLOCK USER CODE.**
+
+### `retry_interval`
+
+**Use for:** controlling how aggressively reliomq retries failed/pending
+deliveries.
+
+**Normally:** leave the default (`10.0`s).
+
+**Increase it when:** outages may last a long time, you want lower retry
+traffic, or you want to reduce log/network churn.
+
+**Decrease it when:** fast recovery matters and your brokers/network can
+safely absorb more frequent retry attempts.
 
 ## Public API
 
@@ -847,6 +1227,8 @@ deployed breaks.
 | `queue_path=` | `outbox_path=` | |
 | `data_topic=` (0.1.x) / `envelope_topic=` (0.2.x) | `relay_topic=` | Two generations of alias, both still accepted. |
 | `ack_topic=` | `delivery_ack_topic=` | |
+| `ack_timeout=` | `delivery_ack_timeout=` | The name now says which ACK -- see [Timeouts, ACKs, and Blocking Behavior](#timeouts-acks-and-blocking-behavior). |
+| `publish_timeout=` | `mqtt_puback_timeout=` | The name now says which layer -- MQTT, not reliomq. |
 | `sender.store` (was `publisher.store`) | `sender.outbox` | |
 | `reliomq.publisher` / `reliomq.bridge` / `reliomq.store` (module paths) | `reliomq.sender` / `reliomq.relay` / `reliomq.outbox` | Old import paths still work via thin re-export modules. |
 | `Relay(..., bridge_logger=...)` | `Relay(..., relay_logger=...)` | |
@@ -892,8 +1274,10 @@ wire encoding, durable FIFO storage, the single-waiter ACK correlator, the
 small Paho helper functions, and configuration validation, respectively.
 `test_sender.py` and `test_relay.py` drive each component through a fake
 Paho client to exercise success, broker outage, return-code failure,
-publish-confirmation timeout, DeliveryAck timeout, restart, FIFO recovery,
-wrong/late/malformed/duplicate ACKs, reconnect, relay failure/success,
+`mqtt_puback_timeout` expiry, `delivery_ack_timeout` expiry (including that
+each config value is actually wired to the layer its name promises, not
+just present under a new name), restart, FIFO recovery, wrong/late/
+malformed/duplicate DeliveryAcks, reconnect, relay failure/success,
 Paho-style lifecycle aliases, and shutdown state transitions.
 `test_pipeline.py` goes a level higher: it wires a real `Sender` to a real
 `Relay` through two linked fake clients that relay `publish()` calls the

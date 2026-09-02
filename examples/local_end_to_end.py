@@ -85,7 +85,7 @@ def main() -> None:
             outbox_path=outbox_path,
             relay_topic=RELAY_TOPIC,
             delivery_ack_topic=DELIVERY_ACK_TOPIC,
-            ack_timeout=5.0,
+            delivery_ack_timeout=5.0,
             retry_interval=3.0,
             log_level="INFO",
         )

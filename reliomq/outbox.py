@@ -172,7 +172,7 @@ class Outbox:
             ]
             self._atomic_rewrite(remaining)
             self._logger.debug(
-                "Persisted message removed | message_id=%s | remaining=%s",
+                "Message removed from Outbox | message_id=%s | remaining=%s",
                 expected.message_id,
                 len(remaining),
             )

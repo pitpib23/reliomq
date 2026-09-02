@@ -135,7 +135,7 @@ class MosquittoIntegrationTests(unittest.TestCase):
                     outbox_path=Path(directory) / "pending.jsonl",
                     relay_topic=relay_topic,
                     delivery_ack_topic=delivery_ack_topic,
-                    ack_timeout=5.0,
+                    delivery_ack_timeout=5.0,
                     retry_interval=0.1,
                 )
             )
