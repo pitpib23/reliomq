@@ -29,7 +29,7 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
-from reliomq import Relay, RelayConfig, Sender, SenderConfig
+from reliomq import DurableMode, Relay, RelayConfig, Sender, SenderConfig
 from reliomq.protocol import DeliveryEnvelope
 
 
@@ -88,7 +88,8 @@ def main() -> None:
             delivery_ack_timeout=5.0,
             retry_interval=3.0,
             log_level="INFO",
-        )
+        ),
+        mode=DurableMode(),
     )
     sender.connect()
 

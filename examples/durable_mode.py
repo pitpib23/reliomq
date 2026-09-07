@@ -17,7 +17,7 @@ def main() -> None:
     )
 
     mode = DurableMode()
-    # Omitting mode entirely, Sender(config), gives the same DurableMode.
+    # DurableMode must be selected explicitly; Sender(config) defaults to FastMode.
     # DurableMode appends and fsyncs every message before publish() returns.
     # It also checkpoints every DeliveryAck. This gives the strongest
     # power-loss protection and lowest practical replay window, at the cost

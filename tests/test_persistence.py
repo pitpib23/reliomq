@@ -236,7 +236,7 @@ class ModeClassTests(unittest.TestCase):
                 FastMode(disconnect_grace=value)
 
     def test_resolve_mode_defaults_and_rejects_non_instances(self) -> None:
-        self.assertEqual(resolve_mode(None), DurableMode())
+        self.assertEqual(resolve_mode(None), FastMode())
         mode = GroupMode()
         self.assertIs(resolve_mode(mode), mode)
         for invalid in (DurableMode, "durable", object(), True):

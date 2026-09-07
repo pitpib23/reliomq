@@ -12,7 +12,7 @@ Run it and read the stderr output top to bottom:
 
     python examples/debug_logging.py
 
-You should see: the default durable publish reaching the Outbox immediately
+You should see: the explicit durable publish reaching the Outbox immediately
 (`publish()` never waits on the network), a connection attempt that never
 completes, and -- once you point this at a real broker instead -- you would
 additionally see each publish attempt, the broker PUBACK, the wait for the
@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import time
 
-from reliomq import Sender, SenderConfig
+from reliomq import DurableMode, Sender, SenderConfig
 
 
 # Intentionally nothing is listening here. Swap in a real broker to see the
@@ -40,13 +40,13 @@ config = SenderConfig(
     debug=True,
 )
 
-with Sender(config) as sender:
+with Sender(config, mode=DurableMode()) as sender:
     message_id = sender.publish(
         "factory/machine1/data",
         {"temperature": 25.2},
     )
     print(
-        f"default-durable message {message_id} stored in the Outbox; watching..."
+        f"durable message {message_id} stored in the Outbox; watching..."
     )
     time.sleep(4.0)
     print(f"pending={sender.pending_count()} -- see the DEBUG lines above for why")

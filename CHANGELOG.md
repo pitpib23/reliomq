@@ -2,13 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
-## 0.6.0 — 2026-09-07
+## 0.6.1 — 2026-09-07
 
 ### Client-level delivery and persistence modes
 
 - Added frozen, validated `DurableMode`, `GroupMode`, and `FastMode` classes.
-  `Sender(config)` remains strict durable behavior and is equivalent to
-  `Sender(config, mode=DurableMode())`.
+- **Breaking default change:** `Sender(config)` now selects `FastMode()` and
+  starts new messages in bounded RAM. Applications that require the previous
+  crash-safe acceptance guarantee must pass `mode=DurableMode()` explicitly.
 - A `Sender` owns exactly one mode for its lifetime. Applications needing
   several policies create several senders with distinct MQTT client IDs and
   Outbox paths. `Sender.publish()` has no per-message `mode=` or
@@ -23,7 +24,7 @@ All notable changes to this project are documented in this file.
   after the last data fsync may be lost; ACKs after the last checkpoint may
   be replayed.
 - `FastMode` starts in bounded RAM (`10000` messages / 32 MiB), spilling at
-  75% high water, 5-second oldest age, 3-second continuous disconnect, an
+  75% high water, 5-second oldest age, 3-second continuous disconnect, a
   PUBACK failure or DeliveryAck timeout while connected, or clean shutdown.
   Transport-disconnect failures observe the disconnect grace period. Spill
   batches default to 1000 messages / 4 MiB and retain RAM ownership until
@@ -57,12 +58,15 @@ All notable changes to this project are documented in this file.
 
 ### Compatibility
 
-- Existing released `Sender.publish(topic, payload, ...)` calls remain durable
-  without changes. The wire protocol, QoS 1/DeliveryAck boundary, stable
-  message IDs, deprecated aliases, and legacy module paths remain supported.
+- Existing `Sender.publish(topic, payload, ...)` call signatures remain valid,
+  but bare `Sender(config)` construction now uses FastMode semantics. The wire
+  protocol, QoS 1/DeliveryAck boundary, stable message IDs, deprecated aliases,
+  and legacy module paths remain supported.
 - The earlier unreleased per-publish mode draft has been superseded by the
   one-client-one-mode API described above.
-- No intentional breaking changes.
+- Migration: change `Sender(config)` to
+  `Sender(config, mode=DurableMode())` wherever RAM-only loss on sudden process
+  or power failure is unacceptable.
 
 ## 0.4.0 — 2026-09-02
 

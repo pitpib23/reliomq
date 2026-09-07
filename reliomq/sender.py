@@ -102,13 +102,14 @@ class Sender:
     """Publish JSON messages with durable FIFO retry and correlated ACKs.
 
     This is reliomq's main entry point. Each instance selects exactly one
-    immutable client-level mode for its lifetime. :class:`DurableMode` is the
-    default and preserves the historical rule that :meth:`publish` fsyncs the
-    complete envelope before returning. :class:`GroupMode` appends every
-    envelope immediately but batches fsync and ACK checkpoints;
-    :class:`FastMode` starts new work in bounded RAM and spills on configured
-    safety triggers. Use separate Sender instances when traffic needs separate
-    policies. Recovered records always remain disk-backed. A persisted envelope stays in the Outbox until
+    immutable client-level mode for its lifetime. :class:`FastMode` is the
+    default and starts new work in bounded RAM, spilling on configured safety
+    triggers. :class:`DurableMode` is the explicit crash-safe policy that
+    fsyncs the complete envelope before :meth:`publish` returns.
+    :class:`GroupMode` appends every envelope immediately but batches fsync
+    and ACK checkpoints. Use separate Sender instances when traffic needs
+    separate policies. Recovered records always remain disk-backed. A
+    persisted envelope stays in the Outbox until
     **both** the QoS 1 MQTT publish to the broker *and* an
     application-level :class:`~reliomq.protocol.DeliveryAck` (published back
     by a :class:`~reliomq.relay.Relay`, or by your own code speaking the
@@ -123,9 +124,10 @@ class Sender:
     ``publish()`` is a managed-delivery operation: it first accepts the
     complete envelope under the selected persistence policy, then keeps it
     in one FIFO until a :class:`~reliomq.protocol.DeliveryAck` confirms it
-    actually got there. Strict durability and restart recovery are the
-    default; weaker modes must be selected explicitly. See the README's "If
-    you already know Paho MQTT" section for the full mapping.
+    actually got there. RAM-first intake is the default; select
+    :class:`DurableMode` explicitly when every accepted message must survive
+    sudden process or power loss. See the README's "If you already know Paho
+    MQTT" section for the full mapping.
 
     Typical usage::
 

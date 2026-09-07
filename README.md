@@ -1,15 +1,15 @@
 # reliomq
 
-**Durable by default, end-to-end confirmed MQTT delivery for Python.**
+**RAM-first by default, end-to-end confirmed MQTT delivery for Python.**
 
 `reliomq` sits on top of [`paho-mqtt`](https://pypi.org/project/paho-mqtt/)
-and adds the part QoS 1 doesn't give you: with the default `DurableMode`, a
-message survives a crash, an outage, or a broker restart, and is retried
-automatically under its original ID until an application confirms it actually
-arrived. A `Sender` owns exactly one delivery/persistence mode for its
-lifetime. Choose `GroupMode` or `FastMode` when a whole stream can trade some
-of that crash guarantee for fewer filesystem syncs or a RAM-first hot path;
-use separate senders when an application needs more than one mode.
+and adds stable message IDs, retry, FIFO ordering, and application-level
+delivery confirmation. The default `FastMode` keeps healthy-path messages in
+bounded RAM and spills them when a safety trigger fires. Select
+`mode=DurableMode()` when every accepted message must survive an immediate
+crash or power loss, or `mode=GroupMode()` for disk-first batching. A `Sender`
+owns exactly one delivery/persistence mode for its lifetime; use separate
+senders when an application needs more than one mode.
 
 ```python
 from reliomq import Sender, SenderConfig
@@ -24,14 +24,19 @@ sender.publish("factory/machine1/data", {"temperature": 25.2})
 sender.disconnect()
 ```
 
-That call uses the backward-compatible default: it durably stores the
-message in the **Outbox** before it ever touches the network. Everything else
-— reconnects, retries, ordering, and knowing when it's actually safe to
-forget the message — is handled for you.
+That call uses the `FastMode` default: the message enters a bounded RAM FIFO
+before network delivery. Pending work spills to the **Outbox** on configured
+safety triggers and clean shutdown, but RAM-only work may be lost in a sudden
+process or power failure. Everything else — reconnects, retries, ordering,
+and knowing when it's actually safe to forget the message — is handled for
+you.
 
 Requires **Python 3.11+** and **Paho MQTT 2.x**.
 
-> **Upgrading from an earlier release?** Nothing breaks. `ReliablePublisher`/
+> **Upgrading to 0.6.1?** The default mode changed: `Sender(config)` now means
+> `Sender(config, mode=FastMode())`. If you relied on the previous crash-safe
+> default, pass `mode=DurableMode()` explicitly. Deprecated compatibility names
+> such as `ReliablePublisher`/
 > `PublisherConfig`/`ReliableMqttBridge`/`BridgeConfig`/`DurableMessageStore`/
 > `Ack`, `queue_path=`, `envelope_topic=`/`data_topic=`, `ack_topic=`,
 > `ack_timeout=`/`publish_timeout=`, and `event_id=` all still work — they
@@ -68,10 +73,11 @@ one publish. It proves nothing about:
 - whether anything ever confirms, at the application level, that the message
   did its job.
 
-By default, `reliomq` closes that gap with a durable Outbox plus an
-application-level **DeliveryAck**, so "the network layer said OK" is never
-mistaken for "the message is handled." The lower-sync modes keep the second
-boundary while explicitly narrowing the first.
+`reliomq` closes the delivery-confirmation gap with an application-level
+**DeliveryAck**, so "the network layer said OK" is never mistaken for "the
+message is handled." Persistence is a separate choice: the `FastMode` default
+is RAM-first, while explicit `DurableMode` closes the local crash/power-loss
+gap with a durable Outbox before network eligibility.
 
 ## How reliomq works
 
@@ -151,10 +157,10 @@ the only one of the three that belongs to the caller.
 ```text
 YOUR APPLICATION THREAD              RELIOMQ BACKGROUND (delivery worker thread)
 
-message_id = sender.publish(...)       # default Sender uses DurableMode
+message_id = sender.publish(...)       # default Sender uses FastMode
         |
-        |  durably fsync'd
-        └───────────────────────►   Outbox: message stored
+        |  accepted into bounded RAM
+        └───────────────────────►   live FIFO: message queued
                                      |
                                      |  worker wakes, picks the oldest message
                                      v
@@ -169,7 +175,8 @@ message_id = sender.publish(...)       # default Sender uses DurableMode
                                      DeliveryAck
                                      |    (timeout instead? -> retry after retry_interval)
                                      v
-                                     cursor checkpointed; message completed
+                                     message completed; disk cursor advances
+                                     only when the record was disk-backed
 
 
 sender.wait_for_delivery(
@@ -199,7 +206,7 @@ the sender, independent of whether anything ever calls
 |---|---|---|
 | `SenderConfig` | Validated transport settings for `Sender`: broker, topics, timeouts, Outbox path, and logging. | Constructing a sender. |
 | `RelayConfig` | Same, for `Relay`: source + destination brokers. | Constructing a relay. |
-| `Sender` | **Public API.** Owns one immutable mode and retries its FIFO until a `DeliveryAck` confirms each message; `DurableMode` is the default. | This is what your application calls: `connect()`, `publish()`, `wait_for_delivery()`, `pending_count()`. |
+| `Sender` | **Public API.** Owns one immutable mode and retries its FIFO until a `DeliveryAck` confirms each message; `FastMode` is the default. | This is what your application calls: `connect()`, `publish()`, `wait_for_delivery()`, `pending_count()`. |
 | `Relay` | **Public API.** Relays from a source broker to a destination broker and only ACKs the source after the destination publish is confirmed. | Run as its own process/service between two brokers. Not needed if you only care about durable *delivery to a broker* rather than end-to-end confirmed forwarding. |
 | `Outbox` | Segmented on-disk FIFO with a persistent head cursor. It contains persistent records, not RAM-only `FastMode` messages. Direct inspection/maintenance requires exclusive ownership of its path. | Rarely — mostly internal. |
 | `DeliveryAck` / `MessageEnvelope` / `DeliveryEnvelope` | The wire-protocol shapes, all correlated by `message_id`. | Only if you're implementing your own consumer or a compatible relay from scratch. |
@@ -229,9 +236,10 @@ the sender, independent of whether anything ever calls
 *transport* operation — it hands one message to the network and its result
 tells you whether the broker accepted that one publish. reliomq's
 `publish()` enters a managed, end-to-end-confirmed delivery workflow with
-retry, FIFO ordering, and a stable ID. Its default `DurableMode` persists
-before network eligibility and survives restart; `GroupMode` and `FastMode`
-make explicitly weaker crash guarantees. Do not assume these behave identically;
+retry, FIFO ordering, and a stable ID. Its default `FastMode` uses bounded RAM
+before network eligibility and may lose RAM-only work on sudden failure;
+explicit `GroupMode` and `DurableMode` provide progressively stronger
+persistence guarantees. Do not assume these behave identically;
 see [Publishing](#publishing) below for exactly what `publish()`'s return
 value does and doesn't promise.
 
@@ -250,9 +258,9 @@ no-op. `Relay` manages *two* Paho clients (one per broker), so its
 
 ## Features
 
-- **Strict durability by default** — `Sender(config)` is equivalent to
-  `Sender(config, mode=DurableMode())` and fsyncs each complete envelope
-  before return or network eligibility.
+- **RAM-first by default** — `Sender(config)` is equivalent to
+  `Sender(config, mode=FastMode())`; healthy-path messages avoid persistent
+  writes and spill on configured safety triggers.
 - **One client, one mode** — choose `DurableMode`, `GroupMode`, or
   `FastMode` when constructing a sender. Create separate senders for streams
   with different policies; `publish()` has no mode override.
@@ -342,8 +350,8 @@ config = SenderConfig(host="localhost", outbox_path="pending", log_level="INFO")
 
 with Sender(config) as sender:          # __enter__ calls connect()
     sender.publish("factory/machine1/data", {"temperature": 25.2})
-# Default DurableMode: a still-pending message survives for next time.
-# __exit__ calls disconnect() and performs the selected mode's clean shutdown.
+# Default FastMode: RAM-only work can be lost on sudden failure.
+# __exit__ calls disconnect() and spills still-pending work on clean shutdown.
 ```
 
 The explicit, Paho-familiar form (equivalent — see
@@ -409,7 +417,8 @@ heartbeat = Sender(heartbeat_config, mode=FastMode())
 ```
 
 `Sender(config)` is exactly equivalent to
-`Sender(config, mode=DurableMode())`.
+`Sender(config, mode=FastMode())`. Pass `mode=DurableMode()` explicitly for
+crash-safe acceptance before `publish()` returns.
 
 | Property | `DurableMode` | `GroupMode` | `FastMode` |
 |---|---|---|---|
@@ -555,7 +564,10 @@ message_id = sender.publish("factory/sensor-01", {"temperature": 25.2})
 # 6. Restart with pending persisted messages -- construct Sender again with
 #    the same outbox_path; recovery preserves order and message_id. A GroupMode
 #    suffix after its latest fsync and RAM-only FastMode work are outside this promise.
-sender = Sender(SenderConfig(host="localhost", outbox_path="pending"))
+sender = Sender(
+    SenderConfig(host="localhost", outbox_path="pending"),
+    mode=DurableMode(),
+)
 sender.connect()
 
 # 7. Inspect this sender's whole live backlog without blocking
@@ -654,10 +666,10 @@ message_id = sender.publish("factory/sensor-01", payload)
 
 Use for: sensors, telemetry, periodic readings, continuous data collection
 -- anything where the application should keep producing data rather than
-pause for each one. This example uses the `DurableMode` default, so reliomq
-stores and retries each message in the background; the caller never blocks on
-the network. Construct a separate `GroupMode` or `FastMode` sender if reduced
-sync cost is worth its documented crash-loss window. **Do not** call
+pause for each one. The full sensor-loop example selects `DurableMode`
+explicitly, so reliomq stores and retries each message in the background; the
+caller never blocks on the network. Use the `FastMode` default only if its
+documented RAM-only crash-loss window is acceptable. **Do not** call
 `wait_for_delivery()` after every reading in a loop like this -- it would
 serialize every reading behind a network round trip. The application should
 normally keep collecting data at its own pace.
@@ -666,7 +678,7 @@ Full runnable version, including graceful shutdown and a backlog warning:
 [examples/sensor_loop.py](examples/sensor_loop.py):
 
 ```python
-sender = Sender(config)
+sender = Sender(config, mode=DurableMode())
 sender.connect()
 sender.loop_start()
 
@@ -1154,7 +1166,7 @@ called it.
 
 | Tool | What it is | Background? | Blocks caller? |
 |---|---|---|---|
-| `Sender` / `SenderConfig` | The main entry point: one client-level mode, FIFO retry, and end-to-end-acknowledged publishing; `DurableMode` by default | Owns one background worker | No (construction/config only) |
+| `Sender` / `SenderConfig` | The main entry point: one client-level mode, FIFO retry, and end-to-end-acknowledged publishing; `FastMode` by default | Owns one background worker | No (construction/config only) |
 | `Relay` / `RelayConfig` | Optional end-to-end forwarder between two brokers | Owns one background worker | No (construction/config only) |
 | `Outbox` | Segmented persistent queue and head cursor underneath `Sender`; excludes RAM-only FastMode messages | N/A (a data store, not a process) | Briefly, for its own file I/O locking -- negligible |
 | `DeliveryAck` | The wire-protocol shape of reliomq's own end-to-end acknowledgement | N/A (a data class) | N/A |
@@ -1305,7 +1317,7 @@ The main entry point. See [Getting started](#getting-started) and
 [Publishing](#publishing) above for full examples of everything below.
 
 - **`Sender(config, *, mode=None, client_factory=None, outbox=None)`** —
-  construct a sender. `mode=None` selects `DurableMode()`; otherwise pass one
+  construct a sender. `mode=None` selects `FastMode()`; otherwise pass one
   `DurableMode`, `GroupMode`, or `FastMode` instance. The normalized mode is
   exposed read-only as `sender.mode`. Raises `TypeError` for another value or
   if `config` isn't a `SenderConfig`. Reads `config.log_level` and calls
@@ -1363,12 +1375,12 @@ The main entry point. See [Getting started](#getting-started) and
 - **`SenderConfig(host, outbox_path, ...)`** — see
   [Configuration reference](#configuration-reference) for every field.
   Raises `ConfigError` on any invalid value, immediately at construction.
-- **`DurableMode()`** — strict default: per-message data fsync and aggressive
+- **`DurableMode()`** — explicit strict mode: per-message data fsync and aggressive
   ACK cursor checkpoint.
 - **`GroupMode(...)`** — immediate disk append with batched data fsync and
   separately batched ACK checkpoints.
-- **`FastMode(...)`** — bounded RAM-first intake with batched spill to the
-  Outbox on configured triggers.
+- **`FastMode(...)`** — the default; bounded RAM-first intake with batched
+  spill to the Outbox on configured triggers.
 
 ### `Relay` / `RelayConfig`
 

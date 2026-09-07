@@ -37,7 +37,7 @@ except ImportError as error:  # pragma: no cover - documentation example
         "Install it with: pip install pymodbus"
     ) from error
 
-from reliomq import Sender, SenderConfig
+from reliomq import DurableMode, Sender, SenderConfig
 
 
 MODBUS_HOST = "192.168.1.50"
@@ -78,7 +78,8 @@ def main() -> None:
             relay_topic="reliomq/relay",
             delivery_ack_topic="reliomq/acks",
             log_level="INFO",
-        )
+        ),
+        mode=DurableMode(),
     )
 
     shutdown_requested = threading.Event()

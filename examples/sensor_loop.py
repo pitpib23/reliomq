@@ -6,7 +6,7 @@ recommended for long-running services:
 
 - connect()/loop_start() once, publish() many times from the sensor loop
   (never recreate the Sender per reading);
-- never block the sensor loop on delivery -- the default durable publish
+- never block the sensor loop on delivery -- the explicit durable publish
   waits only for its Outbox append/fsync, not for the network;
 - check pending_count() to size a "delivery is behind" warning rather than
   polling wait_for_delivery() per reading, which would serialize readings
@@ -29,7 +29,7 @@ import signal
 import threading
 import time
 
-from reliomq import Sender, SenderConfig
+from reliomq import DurableMode, Sender, SenderConfig
 
 
 READING_INTERVAL_SECONDS = 5.0
@@ -54,7 +54,7 @@ def main() -> None:
         log_level="INFO",
     )
 
-    sender = Sender(config)
+    sender = Sender(config, mode=DurableMode())
     sender.connect()
     sender.loop_start()  # harmless no-op here -- connect() already did this
 

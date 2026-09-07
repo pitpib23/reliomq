@@ -9,7 +9,7 @@ confirm delivery. See debug_logging.py for the deeper DEBUG-level view, and
 paho_style_lifecycle.py for the explicit connect()/loop_start() shape.
 """
 
-from reliomq import Sender, SenderConfig
+from reliomq import DurableMode, Sender, SenderConfig
 
 
 config = SenderConfig(
@@ -23,7 +23,7 @@ config = SenderConfig(
     log_level="INFO",
 )
 
-with Sender(config) as sender:
+with Sender(config, mode=DurableMode()) as sender:
     # publish() means reliomq accepted the message into its durable
     # delivery workflow -- not that it has arrived anywhere yet.
     message_id = sender.publish(

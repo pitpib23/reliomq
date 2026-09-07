@@ -201,7 +201,7 @@ class LifecycleLogContentTests(unittest.TestCase):
         # in test_outbox.py (test_opening_an_outbox_logs_the_pending_count).
         for expected in (
             "Sender started",
-            "Message stored in Outbox",
+            "Message accepted by FastMode",
             "MQTT connection established",
             "DeliveryAck received",
             "Message completed",

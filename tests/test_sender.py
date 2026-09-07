@@ -45,6 +45,7 @@ class SenderTests(unittest.TestCase):
         client = FakeClient()
         sender = Sender(
             sender_config(self.outbox_path, **config_overrides),
+            mode=DurableMode(),
             client_factory=client_factory_for(client),
         )
         self.addCleanup(sender.stop)
@@ -107,6 +108,7 @@ class SenderTests(unittest.TestCase):
         restarted_client = FakeClient()
         restarted = Sender(
             sender.config,
+            mode=DurableMode(),
             client_factory=client_factory_for(restarted_client),
         )
         self.addCleanup(restarted.stop)
@@ -381,9 +383,10 @@ class SenderDurabilityModeTests(unittest.TestCase):
 
     def test_default_and_explicit_modes_are_client_level_choices(self) -> None:
         default_sender, _client = self.make_sender()
-        self.assertIsInstance(default_sender.mode, DurableMode)
-        default_sender.publish("factory/data", 1, message_id="default-durable")
-        self.assertTrue(default_sender.outbox.contains("default-durable"))
+        self.assertIsInstance(default_sender.mode, FastMode)
+        default_sender.publish("factory/data", 1, message_id="default-fast")
+        self.assertFalse(default_sender.outbox.contains("default-fast"))
+        self.assertEqual(default_sender.pending_count(), 1)
 
         for mode in (
             DurableMode(),

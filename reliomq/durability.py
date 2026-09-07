@@ -152,10 +152,10 @@ DeliveryMode: TypeAlias = DurableMode | GroupMode | FastMode
 
 
 def resolve_mode(mode: DeliveryMode | None) -> DeliveryMode:
-    """Return one validated lifetime mode, defaulting to ``DurableMode``."""
+    """Return one validated lifetime mode, defaulting to ``FastMode``."""
 
     if mode is None:
-        return DurableMode()
+        return FastMode()
     if type(mode) not in (DurableMode, GroupMode, FastMode):
         raise TypeError(
             "mode must be a DurableMode, GroupMode, or FastMode instance"
