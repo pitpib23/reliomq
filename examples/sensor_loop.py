@@ -6,8 +6,8 @@ recommended for long-running services:
 
 - connect()/loop_start() once, publish() many times from the sensor loop
   (never recreate the Sender per reading);
-- never block the sensor loop on delivery -- publish() only waits for the
-  durable Outbox append, not for the network;
+- never block the sensor loop on delivery -- the default durable publish
+  waits only for its Outbox append/fsync, not for the network;
 - check pending_count() to size a "delivery is behind" warning rather than
   polling wait_for_delivery() per reading, which would serialize readings
   behind network round trips;

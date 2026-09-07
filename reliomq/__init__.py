@@ -41,6 +41,7 @@ from .config import (
     ReliabilityConfig,
     SenderConfig,
 )
+from .durability import DurableMode, FastMode, FastQueueFullError, GroupMode
 from .observability import enable_logging
 from .outbox import DurableMessageStore, Outbox, OutboxError, StoreError
 from .protocol import (
@@ -67,6 +68,10 @@ __all__ = [
     "ProtocolError",
     "ConfigError",
     "DeliveryStatus",
+    "DurableMode",
+    "GroupMode",
+    "FastMode",
+    "FastQueueFullError",
     "enable_logging",
     # Deprecated aliases, kept for backward compatibility.
     "ReliablePublisher",

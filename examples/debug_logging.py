@@ -12,12 +12,12 @@ Run it and read the stderr output top to bottom:
 
     python examples/debug_logging.py
 
-You should see: the Outbox accepting the message immediately (`publish()`
-never waits on the network), a connection attempt that never completes, and
--- once you point this at a real broker instead -- you would additionally
-see each publish attempt, the broker PUBACK, the wait for the DeliveryAck,
-and either delivery confirmation or a retry with its reason. Change
-HOST/PORT below to a real broker to see that full picture.
+You should see: the default durable publish reaching the Outbox immediately
+(`publish()` never waits on the network), a connection attempt that never
+completes, and -- once you point this at a real broker instead -- you would
+additionally see each publish attempt, the broker PUBACK, the wait for the
+DeliveryAck, and either delivery confirmation or a retry with its reason.
+Change HOST/PORT below to a real broker to see that full picture.
 """
 
 from __future__ import annotations
@@ -45,6 +45,8 @@ with Sender(config) as sender:
         "factory/machine1/data",
         {"temperature": 25.2},
     )
-    print(f"message {message_id} stored in the Outbox; watching for a few seconds...")
+    print(
+        f"default-durable message {message_id} stored in the Outbox; watching..."
+    )
     time.sleep(4.0)
     print(f"pending={sender.pending_count()} -- see the DEBUG lines above for why")

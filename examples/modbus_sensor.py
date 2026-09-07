@@ -116,7 +116,7 @@ def main() -> None:
                 "timestamp": datetime.now(UTC).isoformat(),
             }
 
-            # publish() durably stores the reading and returns immediately --
+            # The default publish mode durably stores the reading and returns --
             # it does NOT wait on the network. If the MQTT broker is offline
             # right now, this call still succeeds: the reading sits in the
             # Outbox and reliomq keeps retrying it in the background. A

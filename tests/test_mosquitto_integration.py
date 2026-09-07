@@ -79,9 +79,9 @@ class MosquittoIntegrationTests(unittest.TestCase):
         source_port = free_port()
         destination_port = free_port()
         source_broker = start_broker(source_port)
+        self.addCleanup(self._stop_process, source_broker)
         destination_broker = start_broker(destination_port)
         self.addCleanup(self._stop_process, destination_broker)
-        self.addCleanup(self._stop_process, source_broker)
 
         received = threading.Event()
         subscription_ready = threading.Event()
@@ -96,7 +96,7 @@ class MosquittoIntegrationTests(unittest.TestCase):
         )
         consumer.on_connect = lambda client, _userdata, _flags, reason, _props: (
             client.subscribe(destination_topic, qos=1)
-            if not getattr(reason, "is_failure", int(reason) != 0)
+            if reason == 0
             else None
         )
         consumer.on_subscribe = (

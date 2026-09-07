@@ -183,12 +183,13 @@ def _log_level(value: Any, debug: bool) -> int | None:
 
 @dataclass(frozen=True, slots=True, init=False)
 class SenderConfig:
-    """Configuration for a durable, application-acknowledged :class:`~reliomq.sender.Sender`.
+    """Configuration for an application-acknowledged :class:`~reliomq.sender.Sender`.
 
     ``host``/``outbox_path`` are the only required fields. ``relay_topic``
     and ``delivery_ack_topic`` are reliomq's own transport topics -- not the
     application topic you pass to :meth:`~reliomq.sender.Sender.publish` --
-    and must match the :class:`RelayConfig` on the other end. Set
+    and must match the :class:`RelayConfig` on the other end. The Sender's
+    client-level mode defaults to strict durability. Set
     ``log_level=`` or ``debug=True`` for zero-setup runtime visibility --
     see the README's "Logging" section for what each level shows.
     """

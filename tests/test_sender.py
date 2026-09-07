@@ -4,11 +4,19 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import warnings
 from pathlib import Path
 
 from fakes import FakeClient, FakePublishInfo, client_factory_for
 from reliomq.config import SenderConfig
+from reliomq.durability import (
+    DurableMode,
+    FastMode,
+    FastQueueFullError,
+    GroupMode,
+)
+from reliomq.outbox import OutboxError
 from reliomq.protocol import DeliveryAck, MessageEnvelope
 from reliomq.sender import DeliveryStatus, ReliablePublisher, Sender
 
@@ -311,6 +319,480 @@ class SenderTests(unittest.TestCase):
         self.assertNotIn(message_id, sender._retry_attempts)
 
 
+class SenderDurabilityModeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self._sender_number = 0
+
+    def make_sender(self, mode=None, **config_overrides):
+        self._sender_number += 1
+        outbox_path = Path(self.temporary_directory.name) / (
+            f"modes-{self._sender_number}.jsonl"
+        )
+        client = FakeClient()
+        config = sender_config(outbox_path, **config_overrides)
+        if mode is None:
+            sender = Sender(
+                config,
+                client_factory=client_factory_for(client),
+            )
+        else:
+            sender = Sender(
+                config,
+                mode=mode,
+                client_factory=client_factory_for(client),
+            )
+        self.addCleanup(sender.stop)
+        return sender, client
+
+    @staticmethod
+    def roomy_fast_mode(**overrides) -> FastMode:
+        values = {
+            "ram_max_messages": 100,
+            "ram_max_bytes": 1_000_000,
+            "high_watermark": 1.0,
+            "max_ram_age": 60.0,
+            "disconnect_grace": 60.0,
+            "spill_batch_messages": 100,
+            "spill_batch_bytes": 1_000_000,
+        }
+        values.update(overrides)
+        return FastMode(**values)
+
+    @staticmethod
+    def make_ready(sender: Sender, client: FakeClient) -> None:
+        client.connected = True
+        sender._connected.set()
+        sender._ack_subscription_ready.set()
+
+    @staticmethod
+    def ack_each_publish(sender: Sender, client: FakeClient, observed=None) -> None:
+        def hook(call) -> None:
+            envelope = MessageEnvelope.from_bytes(call["payload"])
+            if observed is not None:
+                observed.append(envelope.message_id)
+            client.emit_message(
+                sender.config.delivery_ack_topic,
+                DeliveryAck(envelope.message_id).to_bytes(),
+            )
+
+        client.publish_hook = hook
+
+    def test_default_and_explicit_modes_are_client_level_choices(self) -> None:
+        default_sender, _client = self.make_sender()
+        self.assertIsInstance(default_sender.mode, DurableMode)
+        default_sender.publish("factory/data", 1, message_id="default-durable")
+        self.assertTrue(default_sender.outbox.contains("default-durable"))
+
+        for mode in (
+            DurableMode(),
+            GroupMode(sync_interval=60.0, ack_checkpoint_interval=60.0),
+            self.roomy_fast_mode(),
+        ):
+            with self.subTest(mode=type(mode).__name__):
+                sender, _client = self.make_sender(mode)
+                self.assertIs(sender.mode, mode)
+
+    def test_mode_is_immutable_and_publish_has_no_mode_override(self) -> None:
+        mode = self.roomy_fast_mode()
+        sender, _client = self.make_sender(mode)
+
+        with self.assertRaises(AttributeError):
+            sender.mode = DurableMode()  # type: ignore[misc]
+        with self.assertRaises(TypeError):
+            sender.publish(  # type: ignore[call-arg]
+                "factory/data", 1, mode=DurableMode()
+            )
+        with self.assertRaises(TypeError):
+            sender.publish(  # type: ignore[call-arg]
+                "factory/data", 1, durability="durable"
+            )
+
+        self.assertIs(sender.mode, mode)
+        self.assertEqual(sender.pending_count(), 0)
+
+    def test_group_appends_immediately_and_syncs_at_the_group_boundary(self) -> None:
+        sender, client = self.make_sender(
+            GroupMode(
+                sync_messages=2,
+                sync_interval=60.0,
+                sync_bytes=1_000_000,
+                ack_checkpoint_interval=60.0,
+            )
+        )
+
+        with unittest.mock.patch.object(
+            sender.outbox, "append", wraps=sender.outbox.append
+        ) as append, unittest.mock.patch.object(
+            sender.outbox, "sync", wraps=sender.outbox.sync
+        ) as sync:
+            sender.publish("factory/data", 1, message_id="group-one")
+
+            self.assertTrue(sender.outbox.contains("group-one"))
+            self.assertEqual(client.publish_calls, [])
+            self.assertEqual(append.call_args.kwargs, {"sync": False})
+            self.assertEqual(sync.call_count, 0)
+
+            sender.publish("factory/data", 2, message_id="group-two")
+
+            self.assertEqual(append.call_count, 2)
+            self.assertEqual(sync.call_count, 1)
+            self.assertEqual(sender._persistence.unsynced_messages, 0)
+
+    def test_group_shutdown_syncs_data_and_checkpoints_ack_progress(self) -> None:
+        sender, client = self.make_sender(
+            GroupMode(
+                sync_messages=100,
+                sync_interval=60.0,
+                sync_bytes=1_000_000,
+                ack_checkpoint_messages=100,
+                ack_checkpoint_interval=60.0,
+            )
+        )
+        sender.publish("factory/data", 1, message_id="group-shutdown")
+        self.make_ready(sender, client)
+        self.ack_each_publish(sender, client)
+
+        with unittest.mock.patch.object(
+            sender.outbox, "sync", wraps=sender.outbox.sync
+        ) as sync, unittest.mock.patch.object(
+            sender.outbox, "checkpoint", wraps=sender.outbox.checkpoint
+        ) as checkpoint:
+            self.assertEqual(
+                sender._process_oldest_once(), DeliveryStatus.DELIVERED
+            )
+            self.assertEqual(sync.call_count, 0)
+            self.assertEqual(checkpoint.call_count, 0)
+
+            sender.stop()
+
+            self.assertEqual(sync.call_count, 1)
+            self.assertEqual(checkpoint.call_count, 1)
+
+    def test_fast_healthy_delivery_never_writes_to_disk(self) -> None:
+        sender, client = self.make_sender(self.roomy_fast_mode())
+        self.make_ready(sender, client)
+        self.ack_each_publish(sender, client)
+
+        with unittest.mock.patch.object(
+            sender.outbox, "append", wraps=sender.outbox.append
+        ) as append, unittest.mock.patch.object(
+            sender.outbox, "append_many", wraps=sender.outbox.append_many
+        ) as append_many:
+            message_id = sender.publish(
+                "factory/data", {"value": 1}, message_id="fast-healthy"
+            )
+
+            self.assertEqual(sender.pending_count(), 1)
+            self.assertEqual(sender.outbox.load(), [])
+            self.assertFalse(sender.wait_for_delivery(message_id, timeout=0))
+            self.assertEqual(
+                sender._process_oldest_once(), DeliveryStatus.DELIVERED
+            )
+
+            self.assertEqual(sender.pending_count(), 0)
+            self.assertTrue(sender.wait_for_delivery(message_id, timeout=0))
+            self.assertEqual(sender.outbox.load(), [])
+            append.assert_not_called()
+            append_many.assert_not_called()
+
+    def test_fast_hard_count_and_byte_limits_do_not_overcommit_ram(self) -> None:
+        count_sender, _client = self.make_sender(
+            self.roomy_fast_mode(ram_max_messages=1, high_watermark=1.0)
+        )
+        spill_error = OutboxError("disk unavailable")
+        with unittest.mock.patch.object(
+            count_sender.outbox, "append_many", side_effect=spill_error
+        ), self.assertLogs("reliomq.sender", level="ERROR"):
+            count_sender.publish("factory/data", 1, message_id="count-one")
+            with self.assertRaises(FastQueueFullError):
+                count_sender.publish("factory/data", 2, message_id="count-two")
+
+        self.assertEqual(count_sender.pending_count(), 1)
+        self.assertEqual(len(count_sender._fast_queue), 1)
+
+        oversized = MessageEnvelope(
+            message_id="too-large",
+            topic="factory/data",
+            payload={"value": "x" * 20},
+        )
+        byte_sender, _client = self.make_sender(
+            self.roomy_fast_mode(ram_max_bytes=len(oversized.to_bytes()) - 1)
+        )
+
+        with self.assertRaisesRegex(FastQueueFullError, "ram_max_bytes"):
+            byte_sender.publish(
+                "factory/data",
+                {"value": "x" * 20},
+                message_id="too-large",
+            )
+
+        self.assertEqual(byte_sender.pending_count(), 0)
+        self.assertEqual(byte_sender._fast_ram_bytes, 0)
+
+    def test_fast_high_watermark_spills_on_count_or_bytes(self) -> None:
+        count_sender, _client = self.make_sender(
+            self.roomy_fast_mode(
+                ram_max_messages=4,
+                high_watermark=0.5,
+            )
+        )
+        with unittest.mock.patch.object(
+            count_sender.outbox,
+            "append_many",
+            wraps=count_sender.outbox.append_many,
+        ) as append_many:
+            count_sender.publish("factory/data", 1, message_id="count-a")
+            self.assertEqual(len(count_sender._fast_queue), 1)
+            count_sender.publish("factory/data", 2, message_id="count-b")
+
+            self.assertEqual(len(count_sender._fast_queue), 0)
+            self.assertEqual(
+                [item.message_id for item in count_sender.outbox.load()],
+                ["count-a", "count-b"],
+            )
+            self.assertEqual(append_many.call_count, 1)
+
+        first = MessageEnvelope(
+            message_id="bytes-a", topic="factory/data", payload="same"
+        )
+        second = MessageEnvelope(
+            message_id="bytes-b", topic="factory/data", payload="same"
+        )
+        byte_sender, _client = self.make_sender(
+            self.roomy_fast_mode(
+                ram_max_bytes=len(first.to_bytes()) + len(second.to_bytes()),
+                high_watermark=0.75,
+            )
+        )
+        byte_sender.publish("factory/data", "same", message_id="bytes-a")
+        self.assertEqual(len(byte_sender._fast_queue), 1)
+        byte_sender.publish("factory/data", "same", message_id="bytes-b")
+
+        self.assertEqual(len(byte_sender._fast_queue), 0)
+        self.assertEqual(
+            [item.message_id for item in byte_sender.outbox.load()],
+            ["bytes-a", "bytes-b"],
+        )
+
+    def test_fast_oldest_age_timer_spills_without_another_publish(self) -> None:
+        sender, _client = self.make_sender(
+            self.roomy_fast_mode(max_ram_age=0.02)
+        )
+        spilled = threading.Event()
+        append_many = sender.outbox.append_many
+
+        def observe_spill(envelopes, *, sync=True):
+            result = append_many(envelopes, sync=sync)
+            spilled.set()
+            return result
+
+        with unittest.mock.patch.object(
+            sender.outbox, "append_many", side_effect=observe_spill
+        ):
+            sender.publish("factory/data", 1, message_id="aged-fast")
+            self.assertTrue(spilled.wait(timeout=1.0))
+
+        self.assertTrue(sender.outbox.contains("aged-fast"))
+        self.assertEqual(len(sender._fast_queue), 0)
+
+    def test_fast_disconnect_spills_only_after_continuous_grace(self) -> None:
+        sender, client = self.make_sender(
+            self.roomy_fast_mode(
+                max_ram_age=60.0,
+                disconnect_grace=0.05,
+            )
+        )
+        self.make_ready(sender, client)
+        sender.publish("factory/data", 1, message_id="disconnect-fast")
+        spilled = threading.Event()
+        append_many = sender.outbox.append_many
+
+        def observe_spill(envelopes, *, sync=True):
+            result = append_many(envelopes, sync=sync)
+            spilled.set()
+            return result
+
+        with unittest.mock.patch.object(
+            sender.outbox, "append_many", side_effect=observe_spill
+        ):
+            client.emit_disconnect()
+            client.emit_connect()
+            self.assertFalse(spilled.wait(timeout=0.08))
+
+            client.emit_disconnect()
+            self.assertTrue(spilled.wait(timeout=1.0))
+
+        self.assertTrue(sender.outbox.contains("disconnect-fast"))
+        self.assertEqual(len(sender._fast_queue), 0)
+
+    def test_fast_delivery_ack_timeout_spills_before_retry(self) -> None:
+        sender, client = self.make_sender(
+            self.roomy_fast_mode(), delivery_ack_timeout=0.01
+        )
+        self.make_ready(sender, client)
+        sender.publish("factory/data", 1, message_id="ack-timeout-fast")
+
+        self.assertEqual(sender.outbox.load(), [])
+        self.assertEqual(sender._process_oldest_once(), DeliveryStatus.RETRY)
+
+        self.assertTrue(sender.outbox.contains("ack-timeout-fast"))
+        self.assertEqual(len(sender._fast_queue), 0)
+        self.assertEqual(sender.pending_count(), 1)
+
+    def test_fast_disconnect_during_puback_wait_observes_grace(self) -> None:
+        sender, client = self.make_sender(self.roomy_fast_mode())
+        self.make_ready(sender, client)
+        sender.publish("factory/data", 1, message_id="puback-disconnect")
+        client.publish_results.append(
+            FakePublishInfo(
+                published=False,
+                wait_hook=lambda _timeout: client.emit_disconnect(),
+            )
+        )
+
+        self.assertEqual(sender._process_oldest_once(), DeliveryStatus.RETRY)
+        self.assertEqual(sender.outbox.load(), [])
+        self.assertEqual(len(sender._fast_queue), 1)
+        self.assertEqual(sender.pending_count(), 1)
+
+        # Reconnect inside the grace period and complete without a spill.
+        client.emit_connect()
+        client.emit_latest_suback()
+        client.publish_hook = lambda _call: client.emit_message(
+            sender.config.delivery_ack_topic,
+            DeliveryAck(message_id="puback-disconnect").to_bytes(),
+        )
+        self.assertEqual(sender._process_oldest_once(), DeliveryStatus.DELIVERED)
+        self.assertEqual(sender.outbox.load(), [])
+        self.assertEqual(sender.pending_count(), 0)
+
+    def test_fast_clean_shutdown_spills_every_pending_message(self) -> None:
+        sender, _client = self.make_sender(self.roomy_fast_mode())
+        for number in range(3):
+            sender.publish(
+                "factory/data", number, message_id=f"shutdown-{number}"
+            )
+
+        self.assertEqual(sender.outbox.load(), [])
+        sender.stop()
+
+        self.assertEqual(len(sender._fast_queue), 0)
+        self.assertEqual(sender._fast_ram_bytes, 0)
+        self.assertEqual(
+            [item.message_id for item in sender.outbox.load()],
+            ["shutdown-0", "shutdown-1", "shutdown-2"],
+        )
+
+    def test_fast_spill_batches_honor_message_and_byte_caps(self) -> None:
+        message_sender, _client = self.make_sender(
+            self.roomy_fast_mode(spill_batch_messages=2)
+        )
+        for number in range(5):
+            message_sender.publish(
+                "factory/data", number, message_id=f"message-batch-{number}"
+            )
+
+        with unittest.mock.patch.object(
+            message_sender.outbox,
+            "append_many",
+            wraps=message_sender.outbox.append_many,
+        ) as append_many:
+            message_sender.stop()
+
+        self.assertEqual(
+            [
+                [envelope.message_id for envelope in call.args[0]]
+                for call in append_many.call_args_list
+            ],
+            [
+                ["message-batch-0", "message-batch-1"],
+                ["message-batch-2", "message-batch-3"],
+                ["message-batch-4"],
+            ],
+        )
+
+        sample = MessageEnvelope(
+            message_id="bytes-batch-0",
+            topic="factory/data",
+            payload="same",
+        )
+        byte_sender, _client = self.make_sender(
+            self.roomy_fast_mode(
+                spill_batch_messages=10,
+                spill_batch_bytes=2 * len(sample.to_bytes()),
+            )
+        )
+        for number in range(5):
+            byte_sender.publish(
+                "factory/data", "same", message_id=f"bytes-batch-{number}"
+            )
+
+        with unittest.mock.patch.object(
+            byte_sender.outbox,
+            "append_many",
+            wraps=byte_sender.outbox.append_many,
+        ) as append_many:
+            byte_sender.stop()
+
+        self.assertEqual(
+            [len(call.args[0]) for call in append_many.call_args_list],
+            [2, 2, 1],
+        )
+
+    def test_failed_fast_spill_keeps_ram_ownership_until_fsync_succeeds(self) -> None:
+        sender, _client = self.make_sender(self.roomy_fast_mode())
+        sender.publish(
+            "factory/data", {"value": 1}, message_id="ram-owned"
+        )
+        item = sender._fast_queue[0]
+        ram_bytes = sender._fast_ram_bytes
+
+        with unittest.mock.patch.object(
+            sender.outbox,
+            "append_many",
+            side_effect=OutboxError("simulated fsync failure"),
+        ), self.assertLogs("reliomq.sender", level="ERROR"):
+            with self.assertRaisesRegex(OutboxError, "simulated fsync failure"):
+                sender.stop()
+
+        self.assertIs(sender._fast_queue[0], item)
+        self.assertEqual(item.state.value, "ram_only")
+        self.assertEqual(sender._fast_ram_bytes, ram_bytes)
+        self.assertEqual(sender.outbox.load(), [])
+
+        sender.stop()
+        self.assertEqual(item.state.value, "disk_backed")
+        self.assertEqual(len(sender._fast_queue), 0)
+        self.assertTrue(sender.outbox.contains("ram-owned"))
+
+    def test_fast_publish_failure_preserves_stable_id_across_restart(self) -> None:
+        sender, client = self.make_sender(self.roomy_fast_mode())
+        self.make_ready(sender, client)
+        client.publish_results.append(FakePublishInfo(rc=4, published=False))
+        message_id = sender.publish("factory/data", {"sequence": 1})
+
+        self.assertEqual(sender._process_oldest_once(), DeliveryStatus.RETRY)
+        stored = sender.outbox.peek_oldest()
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.message_id, message_id)
+        self.assertEqual(stored.payload, {"sequence": 1})
+
+        restarted_client = FakeClient()
+        restarted = Sender(
+            sender.config,
+            mode=self.roomy_fast_mode(),
+            client_factory=client_factory_for(restarted_client),
+        )
+        self.addCleanup(restarted.stop)
+
+        recovered = restarted.outbox.peek_oldest()
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered.message_id, message_id)
+        self.assertEqual(restarted.pending_count(), 1)
+
+
 class SenderPahoStyleLifecycleTests(unittest.TestCase):
     """connect()/loop_start()/disconnect()/loop_stop()/is_connected() must
     honestly delegate to start()/stop() -- these tests pin that down rather
@@ -329,6 +811,19 @@ class SenderPahoStyleLifecycleTests(unittest.TestCase):
 
     def test_is_connected_reflects_paho_connection_state_only(self) -> None:
         self.assertFalse(self.sender.is_connected())
+
+    def test_start_rejects_while_a_previous_worker_is_still_stopping(self) -> None:
+        release = threading.Event()
+        lingering = threading.Thread(target=release.wait, daemon=True)
+        lingering.start()
+        self.sender._worker = lingering
+        try:
+            with self.assertRaisesRegex(RuntimeError, "still stopping"):
+                self.sender.start()
+            self.assertEqual(self.client.connect_calls, [])
+        finally:
+            release.set()
+            lingering.join(timeout=1.0)
 
         self.sender.connect()
         self.client.emit_connect()

@@ -2,6 +2,68 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Client-level delivery and persistence modes
+
+- Added frozen, validated `DurableMode`, `GroupMode`, and `FastMode` classes.
+  `Sender(config)` remains strict durable behavior and is equivalent to
+  `Sender(config, mode=DurableMode())`.
+- A `Sender` owns exactly one mode for its lifetime. Applications needing
+  several policies create several senders with distinct MQTT client IDs and
+  Outbox paths. `Sender.publish()` has no per-message `mode=` or
+  `durability=` override.
+- `DurableMode` appends, flushes, and fsyncs every message before acceptance
+  or network eligibility, and checkpoints the head cursor after every valid
+  DeliveryAck.
+- `GroupMode` appends every message immediately and batches data fsync by
+  message count (`20`), interval (`0.25`s), bytes (`65536`), rotation, or
+  clean shutdown. It separately batches ACK cursor persistence by ACK count
+  (`50`), interval (`1.0`s), completed segment, or clean shutdown. Records
+  after the last data fsync may be lost; ACKs after the last checkpoint may
+  be replayed.
+- `FastMode` starts in bounded RAM (`10000` messages / 32 MiB), spilling at
+  75% high water, 5-second oldest age, 3-second continuous disconnect, an
+  PUBACK failure or DeliveryAck timeout while connected, or clean shutdown.
+  Transport-disconnect failures observe the disconnect grace period. Spill
+  batches default to 1000 messages / 4 MiB and retain RAM ownership until
+  sequential writes, flushes, and fsyncs succeed (one write and data fsync per
+  touched segment). Healthy ACKed messages require no persistent message write.
+  RAM byte limits count canonical envelope bytes, excluding runtime metadata,
+  transient buffers, and the current in-flight snapshot. Disk-backed payloads
+  are read on demand.
+- All modes preserve one stable `message_id` through RAM, append, spill,
+  retry, reconnect, and restart. MQTT PUBACK remains distinct from the
+  authoritative application-level `DeliveryAck`.
+
+### Segmented Outbox and logical head cursor
+
+- New queues use immutable closed segment files, one appendable active
+  segment, and an atomic `(segment_id, byte_offset)` checkpoint. Defaults are
+  8 MiB or 10,000 records per segment.
+- Acknowledging one message advances the logical head; it never rewrites the
+  remaining payload records. Completed closed segments are deleted only after
+  the required checkpoint is fsync-safe.
+- Segment records are length-and-CRC-framed. Torn active tails are repaired to
+  the last complete record; closed-segment corruption fails conservatively.
+- Existing envelope-only JSONL and version-1 enqueue/ACK journal files are
+  replayed and atomically migrated into an authoritative sibling
+  `<outbox_path>.segments` directory. The original legacy file is retained.
+- `Outbox.append_many()` supports sequential FastMode spill writes per segment
+  and returns `AppendResult(appended_count, bytes_written, rotated)`.
+  `Outbox.compact()` is now checkpoint/segment cleanup and never rewrites live
+  payload.
+- Each Outbox path requires exactly one live owner, even within one process.
+
+### Compatibility
+
+- Existing released `Sender.publish(topic, payload, ...)` calls remain durable
+  without changes. The wire protocol, QoS 1/DeliveryAck boundary, stable
+  message IDs, deprecated aliases, and legacy module paths remain supported.
+- The earlier unreleased per-publish mode draft has been superseded by the
+  one-client-one-mode API described above.
+- No intentional breaking changes.
+
 ## 0.4.0 — 2026-09-02
 
 A timeout-naming and execution-model documentation follow-up to 0.3.0. No

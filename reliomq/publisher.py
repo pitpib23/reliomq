@@ -9,7 +9,16 @@ importing ``Sender`` from :mod:`reliomq.sender` (or from the top-level
 
 from __future__ import annotations
 
+from .durability import DurableMode, FastMode, FastQueueFullError, GroupMode
 from .sender import DeliveryStatus, ReliablePublisher, Sender
 
 
-__all__ = ["DeliveryStatus", "ReliablePublisher", "Sender"]
+__all__ = [
+    "DeliveryStatus",
+    "DurableMode",
+    "GroupMode",
+    "FastMode",
+    "FastQueueFullError",
+    "ReliablePublisher",
+    "Sender",
+]
