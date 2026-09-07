@@ -1,4 +1,4 @@
-"""FastMode: bounded RAM-first delivery for replaceable live values.
+"""FastMode = RAM now + disk only if needed, for replaceable live values.
 
 Run with a source broker on localhost and a Relay using the topics below.
 """

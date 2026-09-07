@@ -1,4 +1,4 @@
-"""GroupMode: immediate disk append with grouped synchronization.
+"""GroupMode = write now + fsync later, using grouped synchronization.
 
 Run with a source broker on localhost and a Relay using the topics below.
 """

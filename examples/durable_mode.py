@@ -1,4 +1,4 @@
-"""DurableMode: strongest acceptance guarantee for critical events.
+"""DurableMode = write now + fsync now, for critical events.
 
 Run with a source broker on localhost and a Relay using the topics below.
 """

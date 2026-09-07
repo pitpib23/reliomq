@@ -20,6 +20,8 @@ def config(*, client_id: str, outbox_path: str) -> SenderConfig:
 def main() -> None:
     # One client = one mode. Each client also owns a distinct MQTT client ID
     # and Outbox path; never share an Outbox between live clients/processes.
+    # Durable writes and fsyncs now; Group writes now and fsyncs later; Fast
+    # starts in RAM and writes to disk only when a spill trigger requires it.
     critical = Sender(
         config(client_id="multi-critical", outbox_path="outbox-multi-critical"),
         mode=DurableMode(),

@@ -413,7 +413,8 @@ heartbeat = Sender(heartbeat_config, mode=FastMode())
 
 | Property | `DurableMode` | `GroupMode` | `FastMode` |
 |---|---|---|---|
-| Initial storage | Disk | Disk append | RAM |
+| Mental model | Write now, fsync now | Write now, fsync later | RAM now, disk only if needed |
+| Initial storage | Disk | Filesystem append | RAM |
 | Message write | Every message | Every message | Only on spill |
 | Message fsync | Every message | Batched | Spill only |
 | ACK persistence | Every ACK | Batched | None while RAM-only; aggressive once disk-backed |
@@ -421,6 +422,14 @@ heartbeat = Sender(heartbeat_config, mode=FastMode())
 | Duplicate replay | Lowest practical sender-side window | Bounded by ACK checkpoint window | Depends on whether the message spilled |
 | SD-card activity | Highest | Much lower | Lowest on a healthy route |
 | Typical use | Critical events | Important/high-rate telemetry | Live or replaceable values |
+
+In plain language:
+
+- **DurableMode:** “I cannot lose an accepted message.”
+- **GroupMode:** “I still want disk as the normal path, but I do not want to
+  fsync every message.”
+- **FastMode:** “I do not want disk in the healthy path; persist only when
+  recovery is needed.”
 
 #### `DurableMode`
 

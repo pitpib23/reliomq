@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased
+## 0.6.0 — 2026-09-07
 
 ### Client-level delivery and persistence modes
 
