@@ -408,6 +408,9 @@ and topics never select a policy automatically. If one application needs
 different guarantees, create different senders with different MQTT client IDs
 and different Outbox paths.
 
+For a printable explanation of the trade-offs and implementation details, see
+the [reliomq Delivery Modes guide (PDF)](output/pdf/reliomq_delivery_modes_guide.pdf).
+
 ```python
 from reliomq import DurableMode, FastMode, GroupMode, Sender
 
