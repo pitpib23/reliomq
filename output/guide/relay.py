@@ -27,10 +27,14 @@ config = RelayConfig(
     # Port ของ destination broker ค่า MQTT ปกติคือ 1883
     destination_port=1883,
 
-    # Client ID ของ connection ฝั่ง source ต้องไม่ซ้ำกับ MQTT client ตัวอื่น
+    # Client ID ของ Relay ฝั่งรับข้อความ
+    # connection นี้เชื่อมกับ local/source broker เพื่อรับ envelope ที่ Sender ส่งมา
+    # นี่คือ ID ของ Relay ไม่ใช่ client_id ของ Sender และต้องไม่ใช้ชื่อซ้ำกัน
     source_client_id="demo-relay-source",
 
-    # Client ID ของ connection ฝั่ง destination ต้องต่างจาก source_client_id
+    # Client ID ของ Relay ฝั่งส่งข้อความ
+    # connection นี้เชื่อมกับ remote/destination broker เพื่อส่งข้อมูลไปปลายทางจริง
+    # เป็นคนละ connection กับฝั่งรับ จึงต้องใช้ชื่อต่างจาก source_client_id
     destination_client_id="demo-relay-destination",
 
     # Topic ภายในที่ Relay ใช้รับ envelope จาก Sender
