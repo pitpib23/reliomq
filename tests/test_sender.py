@@ -579,6 +579,63 @@ class SenderDurabilityModeTests(unittest.TestCase):
             ["bytes-a", "bytes-b"],
         )
 
+    def test_fast_disabled_optional_triggers_keep_ram_until_capacity(self) -> None:
+        sender, _client = self.make_sender(
+            self.roomy_fast_mode(
+                ram_max_messages=2,
+                high_watermark=None,
+                max_ram_age=None,
+                disconnect_grace=None,
+            )
+        )
+
+        sender.publish("factory/data", 1, message_id="disabled-a")
+        sender.publish("factory/data", 2, message_id="disabled-b")
+
+        self.assertEqual(len(sender._fast_queue), 2)
+        self.assertEqual(sender.outbox.load(), [])
+        self.assertIsNone(sender._fast_timer)
+
+        # Even a long disconnection does not spill when disconnect_grace is
+        # disabled. The next publish still enforces the mandatory hard cap.
+        sender._disconnected_since = time.monotonic() - 3600
+        with sender._publish_lock, sender._queue_lock:
+            sender._run_fast_maintenance_locked()
+        self.assertEqual(len(sender._fast_queue), 2)
+        self.assertEqual(sender.outbox.load(), [])
+
+        sender.publish("factory/data", 3, message_id="disabled-c")
+        self.assertEqual(
+            [item.message_id for item in sender.outbox.load()],
+            ["disabled-a", "disabled-b"],
+        )
+        self.assertEqual(
+            [item.message_id for item in sender._fast_queue],
+            ["disabled-c"],
+        )
+
+    def test_fast_high_water_failure_retries_without_time_triggers(self) -> None:
+        sender, _client = self.make_sender(
+            self.roomy_fast_mode(
+                ram_max_messages=2,
+                high_watermark=0.5,
+                max_ram_age=None,
+                disconnect_grace=None,
+            ),
+            retry_interval=60.0,
+        )
+
+        with unittest.mock.patch.object(
+            sender.outbox,
+            "append_many",
+            side_effect=OutboxError("disk unavailable"),
+        ), self.assertLogs("reliomq.sender", level="ERROR"):
+            sender.publish("factory/data", 1, message_id="retry-high-water")
+
+        self.assertEqual(len(sender._fast_queue), 1)
+        self.assertIsNotNone(sender._fast_timer)
+        self.assertIsNotNone(sender._fast_timer_deadline)
+
     def test_fast_oldest_age_timer_spills_without_another_publish(self) -> None:
         sender, _client = self.make_sender(
             self.roomy_fast_mode(max_ram_age=0.02)

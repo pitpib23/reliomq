@@ -16,24 +16,25 @@ def main() -> None:
         log_level="INFO",
     )
     mode = GroupMode()  # Simplest choice: use the validated defaults.
-    # The equivalent explicit configuration; adjust these thresholds for
-    # your stream's acceptable loss and duplicate-replay windows.
+    # A custom configuration; adjust these thresholds for your stream's
+    # acceptable loss and duplicate-replay windows.
     mode = GroupMode(
         sync_messages=20,
-        sync_interval=0.25,
+        sync_interval=None,  # Disable the time trigger; count/bytes remain.
         sync_bytes=64 * 1024,
         ack_checkpoint_messages=50,
         ack_checkpoint_interval=1.0,
     )
 
     # Every message is appended to a segment immediately, but is not fsynced
-    # individually. A group fsync is triggered by message count, bytes, time,
+    # individually. Here a group fsync is triggered by message count, bytes,
     # segment rotation, or clean shutdown. Only the range covered by a
     # completed fsync is guaranteed after power loss. ACK cursor progress is
     # batched separately: ACK count, time, a consumed closed segment, or stop
     # triggers a checkpoint. Uncheckpointed ACKs can replay after a crash.
     # Grouping reduces SD sync activity at sustained rates; at low rates the
-    # interval may sync before a full count-sized group has accumulated.
+    # Any individual GroupMode trigger can be disabled with None, but at least
+    # one data-sync trigger and one ACK-checkpoint trigger must remain enabled.
     with Sender(config, mode=mode) as sender:
         message_id = sender.publish(
             "factory/line-4/temperature",

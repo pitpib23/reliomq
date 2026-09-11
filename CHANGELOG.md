@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## 0.6.1 — 2026-09-07
+## 0.6.2 — 2026-09-11
 
 ### Client-level delivery and persistence modes
 
@@ -36,6 +36,19 @@ All notable changes to this project are documented in this file.
 - All modes preserve one stable `message_id` through RAM, append, spill,
   retry, reconnect, and restart. MQTT PUBACK remains distinct from the
   authoritative application-level `DeliveryAck`.
+
+### Optional trigger disabling
+
+- Every GroupMode count, byte, and interval trigger accepts `None` to disable
+  that individual trigger. Validation requires at least one data-sync trigger
+  and at least one ACK-checkpoint trigger to remain enabled.
+- FastMode accepts `None` for `high_watermark`, `max_ram_age`, and
+  `disconnect_grace`, disabling only the corresponding proactive spill rule.
+  Hard RAM limits, delivery-failure spill, capacity spill, and clean-shutdown
+  spill remain active.
+- `ram_max_messages`, `ram_max_bytes`, `spill_batch_messages`, and
+  `spill_batch_bytes` remain mandatory positive integers so RAM ownership and
+  spill work stay bounded.
 
 ### Segmented Outbox and logical head cursor
 

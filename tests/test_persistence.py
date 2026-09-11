@@ -166,6 +166,35 @@ class ModeClassTests(unittest.TestCase):
         self.assertEqual(mode.ack_checkpoint_messages, 9)
         self.assertEqual(mode.ack_checkpoint_interval, 3.0)
 
+    def test_group_none_disables_individual_triggers(self) -> None:
+        mode = GroupMode(
+            sync_messages=None,
+            sync_interval=None,
+            sync_bytes=1234,
+            ack_checkpoint_messages=None,
+            ack_checkpoint_interval=3,
+        )
+
+        self.assertIsNone(mode.sync_messages)
+        self.assertIsNone(mode.sync_interval)
+        self.assertEqual(mode.sync_bytes, 1234)
+        self.assertIsNone(mode.ack_checkpoint_messages)
+        self.assertEqual(mode.ack_checkpoint_interval, 3.0)
+
+    def test_group_requires_one_trigger_in_each_family(self) -> None:
+        with self.assertRaisesRegex(ValueError, "data sync trigger"):
+            GroupMode(
+                sync_messages=None,
+                sync_interval=None,
+                sync_bytes=None,
+            )
+
+        with self.assertRaisesRegex(ValueError, "ACK checkpoint trigger"):
+            GroupMode(
+                ack_checkpoint_messages=None,
+                ack_checkpoint_interval=None,
+            )
+
     def test_group_rejects_invalid_thresholds(self) -> None:
         integer_fields = (
             "sync_messages",
@@ -201,6 +230,17 @@ class ModeClassTests(unittest.TestCase):
         self.assertEqual(mode.max_ram_age, 2.0)
         self.assertEqual(mode.disconnect_grace, 0.0)
 
+    def test_fast_none_disables_optional_spill_triggers(self) -> None:
+        mode = FastMode(
+            high_watermark=None,
+            max_ram_age=None,
+            disconnect_grace=None,
+        )
+
+        self.assertIsNone(mode.high_watermark)
+        self.assertIsNone(mode.max_ram_age)
+        self.assertIsNone(mode.disconnect_grace)
+
     def test_fast_rejects_invalid_integer_fields(self) -> None:
         fields = (
             "ram_max_messages",
@@ -209,7 +249,7 @@ class ModeClassTests(unittest.TestCase):
             "spill_batch_bytes",
         )
         for field in fields:
-            for value in (0, -1, True, 1.0, "1"):
+            for value in (None, 0, -1, True, 1.0, "1"):
                 with self.subTest(field=field, value=value), self.assertRaises(
                     ValueError
                 ):
@@ -341,6 +381,24 @@ class PersistencePolicyTests(unittest.TestCase):
 
         self.assertEqual(self.outbox.sync_calls, 1)
 
+    def test_group_disabled_data_triggers_are_not_evaluated_or_scheduled(self) -> None:
+        self.outbox.record_bytes = 100
+        policy = self.policy(
+            GroupMode(
+                sync_messages=None,
+                sync_interval=None,
+                sync_bytes=250,
+            )
+        )
+
+        policy.append(message(1))
+        policy.append(message(2))
+        self.assertEqual(self.outbox.sync_calls, 0)
+        self.assertEqual(self.timers.timers, [])
+
+        policy.append(message(3))
+        self.assertEqual(self.outbox.sync_calls, 1)
+
     def test_group_elapsed_trigger_is_measured_from_last_completed_sync(self) -> None:
         policy = self.policy(
             GroupMode(sync_messages=99, sync_interval=0.25, sync_bytes=9999)
@@ -410,6 +468,21 @@ class PersistencePolicyTests(unittest.TestCase):
         self.assertEqual(timer.name, "reliomq-group-ack-checkpoint")
         timer.fire()
 
+        self.assertEqual(self.outbox.checkpoint_calls, 1)
+
+    def test_group_disabled_ack_timer_uses_only_the_count_trigger(self) -> None:
+        policy = self.policy(
+            GroupMode(
+                ack_checkpoint_messages=2,
+                ack_checkpoint_interval=None,
+            )
+        )
+
+        self.assertTrue(policy.complete(message(1)))
+        self.assertEqual(self.outbox.checkpoint_calls, 0)
+        self.assertEqual(self.timers.timers, [])
+
+        self.assertTrue(policy.complete(message(2)))
         self.assertEqual(self.outbox.checkpoint_calls, 1)
 
     def test_closed_segment_forces_group_checkpoint(self) -> None:

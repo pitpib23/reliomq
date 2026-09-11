@@ -173,10 +173,16 @@ class PersistencePolicy:
                 self._outbox.completed_closed_segment_pending()
             )
             due = (
-                self._acked_since_checkpoint
-                >= self._mode.ack_checkpoint_messages
-                or now - self._last_ack_checkpoint
-                >= self._mode.ack_checkpoint_interval
+                (
+                    self._mode.ack_checkpoint_messages is not None
+                    and self._acked_since_checkpoint
+                    >= self._mode.ack_checkpoint_messages
+                )
+                or (
+                    self._mode.ack_checkpoint_interval is not None
+                    and now - self._last_ack_checkpoint
+                    >= self._mode.ack_checkpoint_interval
+                )
                 or closed_segment
             )
             if due:
@@ -241,9 +247,18 @@ class PersistencePolicy:
             self._unsynced_messages += 1
             self._unsynced_bytes += framed_bytes
             due = (
-                self._unsynced_messages >= mode.sync_messages
-                or self._unsynced_bytes >= mode.sync_bytes
-                or now - self._last_data_sync >= mode.sync_interval
+                (
+                    mode.sync_messages is not None
+                    and self._unsynced_messages >= mode.sync_messages
+                )
+                or (
+                    mode.sync_bytes is not None
+                    and self._unsynced_bytes >= mode.sync_bytes
+                )
+                or (
+                    mode.sync_interval is not None
+                    and now - self._last_data_sync >= mode.sync_interval
+                )
             )
             if due:
                 self._sync_group_data_locked(suppress_errors=True)
@@ -307,6 +322,8 @@ class PersistencePolicy:
             return
         mode = self._mode
         assert isinstance(mode, GroupMode)
+        if mode.sync_interval is None:
+            return
         delay = (
             mode.sync_interval
             if retry
@@ -330,6 +347,8 @@ class PersistencePolicy:
             return
         mode = self._mode
         assert isinstance(mode, GroupMode)
+        if mode.ack_checkpoint_interval is None:
+            return
         delay = (
             mode.ack_checkpoint_interval
             if retry

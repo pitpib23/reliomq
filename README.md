@@ -33,7 +33,7 @@ you.
 
 Requires **Python 3.11+** and **Paho MQTT 2.x**.
 
-> **Upgrading to 0.6.1?** The default mode changed: `Sender(config)` now means
+> **Upgrading to 0.6.2?** The default mode changed: `Sender(config)` now means
 > `Sender(config, mode=FastMode())`. If you relied on the previous crash-safe
 > default, pass `mode=DurableMode()` explicitly. Deprecated compatibility names
 > such as `ReliablePublisher`/
@@ -489,16 +489,23 @@ fire before 20 messages accumulate; batch size alone does not determine sync
 frequency. Timers also run while delivery is blocked or before `start()`.
 These are trigger intervals, not hard real-time deadlines: scheduling delays
 or storage errors can extend both windows. Deferred sync/checkpoint failures
-are logged and retried without undoing an accepted append or DeliveryAck;
-clean shutdown raises `OutboxError` if the required work still cannot finish.
+are logged and retried without undoing an accepted append or DeliveryAck. If
+the corresponding interval trigger is disabled, retry occurs on the next
+enabled threshold or mandatory boundary rather than on a timer. Clean shutdown
+raises `OutboxError` if the required work still cannot finish.
+
+Each configurable count, byte, or interval trigger accepts `None` to disable
+that trigger. At least one data-sync trigger and at least one ACK-checkpoint
+trigger must remain enabled. Segment rotation and clean shutdown remain
+mandatory boundaries regardless of these settings.
 
 ```python
 mode = GroupMode(
     sync_messages=20,
-    sync_interval=0.25,
+    sync_interval=None,  # disable timer-based data sync
     sync_bytes=64 * 1024,
     ack_checkpoint_messages=50,
-    ack_checkpoint_interval=1.0,
+    ack_checkpoint_interval=None,  # disable timer-based ACK checkpoints
 )
 ```
 
@@ -521,6 +528,13 @@ backlog. Spill begins at
 timeout while the connection remains ready, or when clean shutdown
 begins. A brief disconnect that recovers within the grace period does not
 spill solely because of that disconnect.
+
+Set `high_watermark=None`, `max_ram_age=None`, or `disconnect_grace=None` to
+disable that individual spill trigger. For example,
+`FastMode(disconnect_grace=None)` never spills merely because the transport
+remains disconnected; age, pressure, delivery-failure, capacity, and clean
+shutdown triggers still apply. The hard RAM and spill-batch limits cannot be
+disabled.
 
 Spills select the oldest RAM records in batches bounded by
 `spill_batch_messages=1000` and `spill_batch_bytes=4194304` (4 MiB of serialized
@@ -772,9 +786,11 @@ When the source broker, the destination broker, or `Relay` itself becomes
 unavailable — or a `DeliveryAck` simply stops coming back — the
 application can keep calling `sender.publish(...)` normally within the
 selected mode's limits. `DurableMode` fsyncs locally. `GroupMode` appends
-locally and follows its bounded fsync window. `FastMode` accepts into bounded
-RAM, waits through `disconnect_grace`, and spills if the outage persists. The
-FIFO drains oldest-first once the route returns. Required foreground
+locally and follows its configured fsync window. `FastMode` accepts into
+bounded RAM and normally waits through `disconnect_grace` before spilling;
+when that trigger is `None`, age, pressure, capacity, delivery-failure, and
+clean-shutdown spill rules still apply. The FIFO drains oldest-first once the
+route returns. Required foreground
 persistence failures raise `OutboxError`; deferred GroupMode sync/checkpoint
 failures are logged and retried. FastMode capacity exhaustion raises
 `FastQueueFullError`.
@@ -993,19 +1009,19 @@ Mode configuration belongs to the mode object passed to `Sender`, not to
 
 | `GroupMode` field | Default | Meaning |
 |---|---|---|
-| `sync_messages` | `20` | Unsynced message count that triggers one data fsync |
-| `sync_interval` | `0.25`s | Data sync trigger interval since the last completed fsync while unsynced data exists; scheduling/I/O delays may extend it |
-| `sync_bytes` | `65536` | Unsynced framed bytes that trigger one data fsync |
-| `ack_checkpoint_messages` | `50` | ACKs accumulated in RAM before cursor checkpoint |
-| `ack_checkpoint_interval` | `1.0`s | Pending ACK cursor checkpoint trigger interval; scheduling/I/O delays may extend it |
+| `sync_messages` | `20` | Unsynced message count that triggers one data fsync; `None` disables this trigger |
+| `sync_interval` | `0.25`s | Data sync trigger interval since the last completed fsync while unsynced data exists; `None` disables the timer |
+| `sync_bytes` | `65536` | Unsynced framed bytes that trigger one data fsync; `None` disables this trigger |
+| `ack_checkpoint_messages` | `50` | ACKs accumulated in RAM before cursor checkpoint; `None` disables this trigger |
+| `ack_checkpoint_interval` | `1.0`s | Pending ACK cursor checkpoint interval; `None` disables the timer |
 
 | `FastMode` field | Default | Meaning |
 |---|---|---|
 | `ram_max_messages` | `10000` | Hard bound on RAM-owned message count |
 | `ram_max_bytes` | `33554432` | Hard bound on RAM-only queued canonical envelope bytes (32 MiB); not total process memory |
-| `high_watermark` | `0.75` | Fraction of either RAM bound that begins spill |
-| `max_ram_age` | `5.0`s | Oldest-message age that begins spill |
-| `disconnect_grace` | `3.0`s | Continuous MQTT transport-disconnected time allowed before spill; a pending/rejected ACK subscription is covered by `max_ram_age` |
+| `high_watermark` | `0.75` | Fraction of either RAM bound that begins spill; `None` disables proactive high-water spilling |
+| `max_ram_age` | `5.0`s | Oldest-message age that begins spill; `None` disables age spilling |
+| `disconnect_grace` | `3.0`s | Continuous MQTT transport-disconnected time allowed before spill; `None` disables disconnect spilling |
 | `spill_batch_messages` | `1000` | Maximum messages selected per normal spill batch |
 | `spill_batch_bytes` | `4194304` | Serialized envelope byte target per spill batch (4 MiB); one larger record may spill alone |
 
@@ -1013,7 +1029,10 @@ Mode objects are frozen after construction. Invalid mode settings raise
 `ValueError`: counts and byte limits must be positive integers, durations
 must be finite and positive (except `disconnect_grace`, which may be zero),
 and `high_watermark` must be finite in `(0, 1]`. Booleans, NaN, and infinity
-are rejected. `DurableMode()` has no configuration fields.
+are rejected. `None` is accepted only for the optional triggers documented
+above. GroupMode requires at least one enabled data trigger and one enabled ACK
+trigger. FastMode's RAM and spill-batch limits remain mandatory.
+`DurableMode()` has no configuration fields.
 
 `RelayConfig`:
 

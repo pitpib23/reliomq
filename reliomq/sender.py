@@ -834,6 +834,8 @@ class Sender:
     def _fast_high_water_reached_locked(self) -> bool:
         if not isinstance(self._mode, FastMode) or not self._fast_queue:
             return False
+        if self._mode.high_watermark is None:
+            return False
         message_mark = max(
             1,
             math.ceil(
@@ -879,12 +881,24 @@ class Sender:
             return
 
         now = time.monotonic()
-        deadline = self._fast_queue[0].enqueued_at + self._mode.max_ram_age
-        if self._disconnected_since is not None:
-            deadline = min(
-                deadline,
-                self._disconnected_since + self._mode.disconnect_grace,
+        deadlines: list[float] = []
+        if self._mode.max_ram_age is not None:
+            deadlines.append(
+                self._fast_queue[0].enqueued_at + self._mode.max_ram_age
             )
+        if (
+            self._disconnected_since is not None
+            and self._mode.disconnect_grace is not None
+        ):
+            deadlines.append(
+                self._disconnected_since + self._mode.disconnect_grace
+            )
+        if self._fast_retry_not_before > now:
+            deadlines.append(self._fast_retry_not_before)
+        if not deadlines:
+            self._cancel_fast_timer_locked()
+            return
+        deadline = min(deadlines)
         if self._fast_retry_not_before > now and deadline <= now:
             deadline = self._fast_retry_not_before
 
@@ -930,13 +944,14 @@ class Sender:
 
         disconnected_due = (
             self._disconnected_since is not None
+            and self._mode.disconnect_grace is not None
             and now - self._disconnected_since >= self._mode.disconnect_grace
         )
         try:
             if disconnected_due:
                 self._spill_unpersisted_fast_locked()
             else:
-                while self._fast_queue:
+                while self._fast_queue and self._mode.max_ram_age is not None:
                     eligible = sum(
                         item.enqueued_at + self._mode.max_ram_age <= now
                         for item in self._fast_queue

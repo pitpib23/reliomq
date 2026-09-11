@@ -21,6 +21,14 @@ def _positive_integer(value: object, name: str) -> int:
     return value
 
 
+def _optional_positive_integer(value: object, name: str) -> int | None:
+    """Validate an optional integer trigger; ``None`` disables it."""
+
+    if value is None:
+        return None
+    return _positive_integer(value, name)
+
+
 def _finite_number(value: object, name: str, *, allow_zero: bool) -> float:
     """Validate and normalize a finite duration or ratio."""
 
@@ -40,6 +48,16 @@ def _finite_number(value: object, name: str, *, allow_zero: bool) -> float:
     return normalized
 
 
+def _optional_finite_number(
+    value: object, name: str, *, allow_zero: bool
+) -> float | None:
+    """Validate an optional numeric trigger; ``None`` disables it."""
+
+    if value is None:
+        return None
+    return _finite_number(value, name, allow_zero=allow_zero)
+
+
 @dataclass(frozen=True, slots=True)
 class DurableMode:
     """Reliability-first mode: fsync messages and ACK progress individually."""
@@ -49,46 +67,61 @@ class DurableMode:
 class GroupMode:
     """Append immediately while batching data fsync and ACK checkpoints."""
 
-    sync_messages: int = 20
-    sync_interval: float = 0.25
-    sync_bytes: int = 64 * 1024
-    ack_checkpoint_messages: int = 50
-    ack_checkpoint_interval: float = 1.0
+    sync_messages: int | None = 20
+    sync_interval: float | None = 0.25
+    sync_bytes: int | None = 64 * 1024
+    ack_checkpoint_messages: int | None = 50
+    ack_checkpoint_interval: float | None = 1.0
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
             "sync_messages",
-            _positive_integer(self.sync_messages, "sync_messages"),
+            _optional_positive_integer(self.sync_messages, "sync_messages"),
         )
         object.__setattr__(
             self,
             "sync_interval",
-            _finite_number(
+            _optional_finite_number(
                 self.sync_interval, "sync_interval", allow_zero=False
             ),
         )
         object.__setattr__(
             self,
             "sync_bytes",
-            _positive_integer(self.sync_bytes, "sync_bytes"),
+            _optional_positive_integer(self.sync_bytes, "sync_bytes"),
         )
         object.__setattr__(
             self,
             "ack_checkpoint_messages",
-            _positive_integer(
+            _optional_positive_integer(
                 self.ack_checkpoint_messages, "ack_checkpoint_messages"
             ),
         )
         object.__setattr__(
             self,
             "ack_checkpoint_interval",
-            _finite_number(
+            _optional_finite_number(
                 self.ack_checkpoint_interval,
                 "ack_checkpoint_interval",
                 allow_zero=False,
             ),
         )
+        if (
+            self.sync_messages is None
+            and self.sync_interval is None
+            and self.sync_bytes is None
+        ):
+            raise ValueError(
+                "at least one GroupMode data sync trigger must be enabled"
+            )
+        if (
+            self.ack_checkpoint_messages is None
+            and self.ack_checkpoint_interval is None
+        ):
+            raise ValueError(
+                "at least one GroupMode ACK checkpoint trigger must be enabled"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,9 +130,9 @@ class FastMode:
 
     ram_max_messages: int = 10_000
     ram_max_bytes: int = 32 * 1024 * 1024
-    high_watermark: float = 0.75
-    max_ram_age: float = 5.0
-    disconnect_grace: float = 3.0
+    high_watermark: float | None = 0.75
+    max_ram_age: float | None = 5.0
+    disconnect_grace: float | None = 3.0
     spill_batch_messages: int = 1_000
     spill_batch_bytes: int = 4 * 1024 * 1024
 
@@ -115,22 +148,24 @@ class FastMode:
             _positive_integer(self.ram_max_bytes, "ram_max_bytes"),
         )
 
-        high_watermark = _finite_number(
+        high_watermark = _optional_finite_number(
             self.high_watermark, "high_watermark", allow_zero=False
         )
-        if high_watermark > 1:
+        if high_watermark is not None and high_watermark > 1:
             raise ValueError("high_watermark must be greater than 0 and at most 1")
         object.__setattr__(self, "high_watermark", high_watermark)
 
         object.__setattr__(
             self,
             "max_ram_age",
-            _finite_number(self.max_ram_age, "max_ram_age", allow_zero=False),
+            _optional_finite_number(
+                self.max_ram_age, "max_ram_age", allow_zero=False
+            ),
         )
         object.__setattr__(
             self,
             "disconnect_grace",
-            _finite_number(
+            _optional_finite_number(
                 self.disconnect_grace, "disconnect_grace", allow_zero=True
             ),
         )
